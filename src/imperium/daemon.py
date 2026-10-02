@@ -18,7 +18,7 @@ import urllib.parse
 from . import (__version__, approvals, audit, backup, builders, config, feeds, journal, liveness, opencode, outbox,
                paths, retention, rounds, snapshot, tokens, verify)
 from .engine import Engine
-from . import transport
+from . import notify, transport
 from . import fsutil
 from .store import Store, StoreFailed, meta_get, meta_set
 
@@ -140,6 +140,8 @@ def r_status(d, principal, body, query):
                        **(d.engine.state(b["name"]) if d.engine else {})})
     return {"run_id": d.run_id, "pid": d.pid, "port": d.port, "started": d.started, "version": __version__,
             "transport": getattr(_request, "transport", "tcp"), "isolation": bool(d.pipes),
+            "notify": {"enabled": bool(d.notifier and d.notifier.enabled),
+                       "failing": bool(d.notifier and d.notifier.failures)},
             "principal": principal, "head_seq": head_seq, "chain": d.chain, "archives": d.archives,
             "observe_only": observe_only, "stop_all": stop_all, "quarantine": d.quarantine(), "consumers": consumers,
             "auto_answers_unreported": auto_unreported, "approvals_open": approvals_open,
@@ -1126,6 +1128,7 @@ class Daemon:
         self._stop_lock = threading.Lock()
         self.engine = None
         self.verifier = None
+        self.notifier = None
         self.pipes = {}
         self.leases = {}  # director principal -> monotonic time of its last presence call (this run only)
         self.dash_tokens = {}  # sha256 of a read-only dashboard token -> last use (this run only)
@@ -1146,6 +1149,8 @@ class Daemon:
             self.verifier = verify.Verifier(self)
             self.verifier.start()
             self.engine.start()
+            self.notifier = notify.Notifier(self)
+            self.notifier.start()
         except BaseException:
             for p in self.pipes.values():
                 p.stop()
@@ -1266,6 +1271,8 @@ class Daemon:
             self.engine.stop()
         if self.verifier:
             self.verifier.stop()
+        if self.notifier:
+            self.notifier.stop()
         try:
             with open(paths.daemon_json(self.home), encoding="utf-8") as f:
                 if json.load(f).get("run_id") == self.run_id:

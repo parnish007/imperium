@@ -146,6 +146,21 @@ WORKING, IDLE. Only WORKING can stall: no new message and no growth of the reply
 (30 min), then `HANG_SUSPECTED`. Imperium reports; it does not kill. `imperium gate` reports free memory against
 `min_free_gb` (3 GB); a message sent with `--needs-resources` waits until it is OK.
 
+### 7.1 Owner notifications
+
+`[notify] command` (an argv list) runs for every event at or above `floor` (ACTION by default, or CRITICAL), with
+the event as JSON on stdin (`seq`, `ts`, `type`, `severity`, `builder`, `headline`, `data`) and in `IMPERIUM_EVENT_*`
+variables. Builder-written text is never passed. The notifier is a feed consumer: events go out in order, at least
+once, across restarts; an event is acknowledged only after the command exits 0 within `timeout` (30 s). A failing
+command is retried with backoff (up to 5 min) and reported once per failure streak (`NOTIFY_FAILED`, then
+`NOTIFY_RECOVERED`); `status` shows `notify.failing`. A new notifier starts at the current head.
+
+```toml
+[notify]
+command = ["notify-send", "Imperium"]                                  # Linux; the headline is in IMPERIUM_EVENT_HEADLINE
+# command = ["python3", "/home/me/bin/imperium-notify.py"]             # anything that reads JSON from stdin
+```
+
 ## 8. Integrity, backup, restore
 
 SQLite in WAL mode with `synchronous=FULL`, one writing process. A database error fails the daemon closed (writes
@@ -172,5 +187,4 @@ swapped in one rename), and starts observe-only until the owner confirms.
 ## 10. Not yet
 
 Adapters other than OpenCode over HTTP; pulling
-work instead of pushing it (needs a fetch that also claims); notifications to the owner outside the feed; dashboard
-actions.
+work instead of pushing it (needs a fetch that also claims); dashboard actions.

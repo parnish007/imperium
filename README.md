@@ -112,6 +112,8 @@ imperium stop-all / resume-all     # the emergency brake (anyone) and its releas
 imperium backup / restore <file> / verify-journal / export --out f.jsonl / doctor / down
 ```
 
+To be told about anything that needs you (ACTION and CRITICAL events) outside the feed, set a command in `[notify]`; see [docs/SPEC.md](docs/SPEC.md) §7.1.
+
 Every command takes `--json`. Exit codes: `0` ok, `1` error, `2` usage, `3` service not running, `4` refused, `5` integrity or doctor failure. Inside a Claude Code session the CLI acts as the director and never falls back to the owner's credential; the owner adds `--as owner` there. Configuration: `~/.imperium/imperium.toml` (unknown keys are rejected).
 
 ## How a round is verified
@@ -137,8 +139,9 @@ The details, and what each guarantee does *not* cover, are in [docs/SPEC.md](doc
 | 7 | Liveness (sub-agent aware) and the resource gate | **done** |
 | 8 | Claude Code plugin and the director's playbook | **done** |
 | 9 | Read-only dashboard | **done** |
+| — | Isolation mode (Windows pipes, Unix sockets), owner notifications, CI on three systems | **done** |
 
-Next: more builder adapters (Claude Code, Codex, ACP), owner notifications, dashboard actions.
+Next: more builder adapters (Claude Code, Codex, ACP), dashboard actions.
 
 ## Testing
 

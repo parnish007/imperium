@@ -41,6 +41,12 @@ SCHEMA = {
         "owner_accounts": (list, []),
         "builder_accounts": (list, []),
     },
+    "notify": {
+        # A command (argv list) run for every event at or above `floor`, with the event as JSON on stdin.
+        "command": (list, []),
+        "floor": (str, "ACTION"),  # ACTION or CRITICAL
+        "timeout": (float, 30.0),
+    },
     "integrity": {
         "verify_interval": (float, 300.0),  # seconds between journal chain checks while running
     },
