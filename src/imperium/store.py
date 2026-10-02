@@ -51,6 +51,28 @@ SCHEMA = [
         result TEXT NOT NULL
     );
     """,
+    # version 2: builders and adapter checkpoints (stage 2)
+    """
+    CREATE TABLE builders(
+        name TEXT PRIMARY KEY,
+        adapter TEXT NOT NULL,
+        endpoint TEXT NOT NULL,
+        session_id TEXT NOT NULL,
+        directory TEXT NOT NULL,
+        password_env TEXT,
+        password_file TEXT,
+        opencode_version TEXT,
+        allowed_version TEXT,
+        paused INTEGER NOT NULL DEFAULT 0,
+        created TEXT NOT NULL,
+        UNIQUE(adapter, endpoint, session_id)
+    );
+    CREATE TABLE checkpoints(
+        builder TEXT PRIMARY KEY,
+        data TEXT NOT NULL,
+        updated TEXT NOT NULL
+    );
+    """,
 ]
 
 

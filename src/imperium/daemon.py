@@ -14,7 +14,8 @@ import threading
 import time
 import urllib.parse
 
-from . import __version__, audit, backup, config, feeds, journal, paths, retention, tokens
+from . import __version__, audit, backup, builders, config, feeds, journal, opencode, paths, retention, tokens
+from .engine import Engine
 from .store import Store, StoreFailed, meta_get
 
 log = logging.getLogger("imperiumd")
@@ -111,10 +112,66 @@ def r_status(d, principal, body, query):
                               "unacked_action_or_critical": unacked})
         observe_only = meta_get(conn, "observe_only")
         dropped = audit.dropped(conn)
+        bl = []
+        for b in builders.list_(conn):
+            r = conn.execute("SELECT data FROM checkpoints WHERE builder=?", (b["name"],)).fetchone()
+            cp = json.loads(r[0]) if r else {}
+            bl.append({"name": b["name"], "endpoint": b["endpoint"], "session_id": b["session_id"],
+                       "opencode_version": b["opencode_version"], "status": cp.get("status"),
+                       "permissions_pending": cp.get("permissions"), "questions_pending": cp.get("questions"),
+                       **(d.engine.state(b["name"]) if d.engine else {})})
     return {"run_id": d.run_id, "pid": d.pid, "port": d.port, "started": d.started, "version": __version__,
             "principal": principal, "head_seq": head_seq, "chain": d.chain, "archives": d.archives,
             "observe_only": observe_only, "consumers": consumers, "needs_you": needs_you,
-            "audit_dropped": dropped}
+            "audit_dropped": dropped, "builders": bl}
+
+
+def r_builders(d, principal, body, query):
+    name = query.get("name", [None])[0]
+    with d.store.read() as conn:
+        if name:
+            return {"builder": builders.get(conn, name)}
+        return {"builders": builders.list_(conn)}
+
+
+def r_builder_add(d, principal, body, query):
+    name, directory = str(_req(body, "name")), str(_req(body, "directory"))
+    session_id = str(_req(body, "session_id"))
+    pw_env, pw_file = body.get("password_env"), body.get("password_file")
+    if pw_env and pw_file:
+        raise HttpError(400, "give either a password variable or a password file, not both")
+    endpoint = builders.validate(name, str(_req(body, "endpoint")))
+    version = None
+    if body.get("check", True):
+        try:
+            pw = builders.password({"password_env": pw_env, "password_file": pw_file})
+        except OSError as e:
+            raise HttpError(409, f"cannot read the password file: {e.strerror}") from None
+        client = opencode.OpenCodeClient(endpoint, directory=directory, password=pw,
+                                         timeout=d.cfg["opencode"]["timeout"])
+        try:
+            version = (client.health() or {}).get("version")
+            sess = client.session(session_id)
+        except opencode.OCUnreachable:
+            raise HttpError(409, f"cannot reach {endpoint}; is `opencode serve` running there?") from None
+        except opencode.OCError as e:
+            if e.status == 404:
+                raise HttpError(409, f"session {session_id} not found on {endpoint} in {directory}") from None
+            if e.status in (401, 403):
+                raise HttpError(409, "the OpenCode server refused the password") from None
+            raise HttpError(409, str(e)) from None
+        if builders.norm_dir(sess.get("directory") or "") != builders.norm_dir(directory):
+            raise HttpError(409, f"session {session_id} belongs to {sess.get('directory')}, not {directory}")
+    with d.store.tx() as conn:
+        b = builders.add(conn, name=name, endpoint=endpoint, session_id=session_id, directory=directory,
+                         password_env=pw_env, password_file=pw_file, version=version, caller=principal)
+    return {"builder": b}
+
+
+def r_builder_remove(d, principal, body, query):
+    with d.store.tx() as conn:
+        builders.remove(conn, str(_req(body, "name")), caller=principal)
+    return {"removed": body["name"]}
 
 
 def r_consumers(d, principal, body, query):
@@ -191,6 +248,9 @@ ROUTES = {
     ("GET", "/v1/health"): (r_health, None, False),
     ("GET", "/v1/status"): (r_status, "any", False),
     ("POST", "/v1/consumers"): (r_consumers, "any", True),
+    ("GET", "/v1/builders"): (r_builders, "any", False),
+    ("POST", "/v1/builders"): (r_builder_add, "owner", True),
+    ("POST", "/v1/builders/remove"): (r_builder_remove, "owner", True),
     ("POST", "/v1/events_since"): (r_events_since, "any", True),
     ("POST", "/v1/ack"): (r_ack, "any", True),
     ("GET", "/v1/show"): (r_show, "any", False),
@@ -303,6 +363,8 @@ class _Handler(http.server.BaseHTTPRequestHandler):
             out = fn(d, principal, body, urllib.parse.parse_qs(url.query))
         except feeds.NotYours as e:
             raise HttpError(403, str(e)) from None
+        except builders.Conflict as e:
+            raise HttpError(409, str(e)) from None
         except (feeds.Refused, retention.PruneRefused, sqlite3.IntegrityError) as e:
             raise HttpError(409, str(e)) from None
         except StoreFailed as e:
@@ -352,6 +414,7 @@ class Daemon:
         self._lock = None
         self._stopped = False
         self._stop_lock = threading.Lock()
+        self.engine = None
         self.stopped = threading.Event()  # set once every resource is released
         self.buckets = Buckets(self.cfg["daemon"]["rate_per_sec"], self.cfg["daemon"]["burst"])
 
@@ -364,6 +427,8 @@ class Daemon:
             self.server.imperium = self
             self.port = self.server.server_address[1]
             self._write_info()
+            self.engine = Engine(self)
+            self.engine.start()
         except BaseException:
             if self.store is not None:
                 self.store.close()
@@ -407,6 +472,8 @@ class Daemon:
             self._stopped = True
         self.server.shutdown()
         self.server.server_close()
+        if self.engine:
+            self.engine.stop()
         try:
             with open(paths.daemon_json(self.home), encoding="utf-8") as f:
                 if json.load(f).get("run_id") == self.run_id:

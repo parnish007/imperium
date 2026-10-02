@@ -11,6 +11,7 @@ import sqlite3
 import subprocess
 import sys
 import time
+import urllib.parse
 
 from . import __version__, backup, config, feeds, journal, paths, retention, tokens
 from .client import ApiError, Client, DaemonDown
@@ -80,6 +81,23 @@ def _parser(err):
     r = add("restore", "restore a backup; the daemon must be stopped (owner)")
     r.add_argument("path")
     add("restore-confirm", "end observe-only mode after a restore (owner)")
+    bl = add("builder", "register and inspect builders")
+    bsub = bl.add_subparsers(dest="builder_cmd", parser_class=_Parser)
+    bsub.required = True
+    ba = bsub.add_parser("add", help="register an OpenCode session as a builder (owner)", err=err)
+    ba.add_argument("name")
+    ba.add_argument("--endpoint", required=True, help="the OpenCode server, e.g. http://127.0.0.1:<port>")
+    ba.add_argument("--session", required=True, help="the OpenCode session id (ses_...)")
+    ba.add_argument("--directory", required=True, help="the session's workspace directory")
+    g = ba.add_mutually_exclusive_group()
+    g.add_argument("--password-env", help="name of the variable holding the server password")
+    g.add_argument("--password-file", help="file holding the server password")
+    ba.add_argument("--no-check", action="store_true", help="do not contact the server first")
+    bsub.add_parser("list", help="list builders", err=err)
+    bs = bsub.add_parser("show", help="show one builder", err=err)
+    bs.add_argument("name")
+    br = bsub.add_parser("remove", help="unregister a builder (owner)", err=err)
+    br.add_argument("name")
     t = add("token", "manage tokens (owner)")
     t.add_argument("action", choices=["rotate"])
     return p
@@ -330,6 +348,24 @@ def cmd_restore_confirm(ctx):
     return _owner_or_refuse(ctx).call("POST", "/v1/restore-confirm", {})
 
 
+def cmd_builder(ctx):
+    a = ctx["args"]
+    if a.builder_cmd == "list":
+        return _client(ctx).call("GET", "/v1/builders")
+    if a.builder_cmd == "show":
+        return _client(ctx).call("GET", "/v1/builders?name=" + urllib.parse.quote(a.name))
+    c = _owner_or_refuse(ctx)
+    if a.builder_cmd == "remove":
+        return c.call("POST", "/v1/builders/remove", {"name": a.name})
+    body = {"name": a.name, "endpoint": a.endpoint, "session_id": a.session, "directory": a.directory,
+            "check": not a.no_check}
+    if a.password_env:
+        body["password_env"] = a.password_env
+    if a.password_file:
+        body["password_file"] = os.path.abspath(a.password_file)
+    return c.call("POST", "/v1/builders", body)
+
+
 def cmd_token(ctx):
     return _owner_or_refuse(ctx).call("POST", "/v1/token/rotate", {})
 
@@ -412,6 +448,7 @@ COMMANDS = {
     "init": cmd_init, "up": cmd_up, "down": cmd_down, "status": cmd_status, "doctor": cmd_doctor,
     "events": cmd_events, "ack": cmd_ack, "show": cmd_show, "verify-journal": cmd_verify, "prune": cmd_prune,
     "backup": cmd_backup, "restore": cmd_restore, "restore-confirm": cmd_restore_confirm, "token": cmd_token,
+    "builder": cmd_builder,
 }
 
 

@@ -4,7 +4,7 @@
 
 A director is an AI session that plans and reviews work (for example a Claude Code session). A builder is a coding agent that does the work (OpenCode first). A human *owner* stays in charge of both.
 
-> **Status: pre-alpha.** Stage 1 of 9 is built: the store, the event journal, the reading feeds, the background service and the command line. Prompt delivery to builders, rounds and claim verification, approvals, the MCP server and the dashboard are designed but **not built yet**. Do not rely on it for real work.
+> **Status: pre-alpha.** Stages 1-2 of 9 are built: the store, the event journal, the reading feeds, the background service, the command line, and *watching* OpenCode builders (everything a builder does becomes an event). Prompt delivery, rounds and claim verification, approvals, the MCP server and the dashboard are designed but **not built yet**. Do not rely on it for real work.
 
 ## Why
 
@@ -77,7 +77,12 @@ imperium verify-journal  # check the integrity chain (works with the service sto
 imperium backup          # online backup; `imperium restore <file>` with the service stopped
 imperium doctor          # check the installation (`--contract` prints a setup report)
 imperium down            # stop the service
+
+imperium builder add coding --endpoint http://127.0.0.1:<port> --session <ses_id> \n    --directory <workspace> --password-env OPENCODE_SERVER_PASSWORD   # watch an OpenCode session
+imperium builder list   # registered builders; `imperium status` shows reachability
 ```
+
+Once a builder is registered, the service polls it and journals what happens: turns starting and ending, tool errors, permission asks, questions, retries, compactions, and any message that Imperium did not send (shown to you as CRITICAL). Builder text is treated as untrusted: secrets are redacted before anything is stored. The server password is never stored, only the name of the variable (or file) that holds it.
 
 Inside a Claude Code session the CLI acts as the *director* and never falls back to the owner's credential; the owner adds `--as owner` there. Every command takes `--json`. Exit codes: `0` ok, `1` error, `2` usage, `3` service not running, `4` refused, `5` integrity or doctor failure.
 
@@ -88,8 +93,8 @@ Configuration lives in `~/.imperium/imperium.toml`. Unknown keys are rejected.
 | Stage | Content | State |
 |---|---|---|
 | 1 | Store, journal and integrity chain, retention, backup and restore, feeds, call audit, service, CLI | **done** |
-| 2 | Fake OpenCode server and the adapter's read path | next |
-| 3 | Queue, dispatcher and the delivery state machine, recovery | planned |
+| 2 | Watching OpenCode builders: turns, messages, permissions, questions, status, catch-up after downtime | **done** |
+| 3 | Queue, dispatcher and the delivery state machine, recovery | next |
 | 4 | Rounds, claims, escalation, builder MCP | planned |
 | 5 | Approvals, director identity, questions, path rules | planned |
 | 6 | Director MCP server, `watch`, tokens and the full local API | planned |
