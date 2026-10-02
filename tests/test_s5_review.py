@@ -62,6 +62,26 @@ class TestVerification(RoundBase):
         self.assertEqual(self.round(rid)["state"], "CLAIMED_READY")
         self.assertIn("VERIFICATION_VOIDED", self.types())
 
+    def test_c3_results_of_a_run_during_which_the_checks_changed_are_not_used(self):
+        self.standing_check()
+        rid, nonce = self.open()
+        self.fix()
+        self.report(rid, nonce)
+        self.c.call("POST", "/v1/rounds/objective", {"id": rid, "met": True})
+        real = self.h.d.verifier._run_on
+
+        def run_on(*a, **kw):  # a failing required check is defined while the others run
+            res = real(*a, **kw)
+            if not any(c["id"] == "strict" for c in self.c.call("GET", "/v1/checks")["checks"]):
+                self.c.call("POST", "/v1/checks", {"id": "strict", "builder": "coding",
+                                                   "argv": [PY, "-c", "raise SystemExit(1)"], "timeout": 60})
+            return res
+
+        self.h.d.verifier._run_on = run_on
+        r = self.verify(rid)
+        self.assertNotEqual(r["state"], "VERIFIED")
+        self.assertIsNone(r["checks_ok_generation"])
+
     def test_c15_results_are_not_published_from_a_quarantined_journal(self):
         self.standing_check()
         rid, nonce = self.open()

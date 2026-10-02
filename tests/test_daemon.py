@@ -2,6 +2,7 @@
 import http.client
 import json
 import os
+import time
 import unittest
 
 from imperium import client, daemon, journal, tokens
@@ -73,10 +74,17 @@ class TestTransport(Base):
             before = journal.head(conn)[0]
         for _ in range(5):
             self.c.call("GET", "/v1/status")
+        # the audit row is written after the response is sent (it records the result): give the last one a moment
+        deadline = time.monotonic() + 5
+        while True:
+            with self.h.d.store.read() as conn:
+                n = conn.execute("SELECT COUNT(*) FROM call_audit WHERE route='GET /v1/status'").fetchone()[0]
+            if n >= 5 or time.monotonic() > deadline:
+                break
+            time.sleep(0.05)
+        self.assertEqual(n, 5)
         with self.h.d.store.read() as conn:
             self.assertEqual(journal.head(conn)[0], before)
-            n = conn.execute("SELECT COUNT(*) FROM call_audit WHERE route='GET /v1/status'").fetchone()[0]
-        self.assertEqual(n, 5)
 
 
 class TestFeedsApi(Base):

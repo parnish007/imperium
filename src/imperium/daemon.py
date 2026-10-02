@@ -959,6 +959,12 @@ class _Server(socketserver.ThreadingMixIn, http.server.HTTPServer):
     daemon_threads = True
     allow_reuse_address = False
 
+    def server_bind(self):
+        # HTTPServer.server_bind looks up socket.getfqdn(host), a reverse DNS lookup that can take many seconds
+        # (it made `imperium up` time out on macOS). The address is always 127.0.0.1: no name is needed.
+        socketserver.TCPServer.server_bind(self)
+        self.server_name, self.server_port = self.server_address[:2]
+
 
 class _Handler(http.server.BaseHTTPRequestHandler):
     server_version = "imperiumd"
