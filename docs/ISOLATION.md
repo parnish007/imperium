@@ -16,6 +16,10 @@ What it gives you:
 What it does not give you:
 - the director (Claude Code) still runs as your account, so owner and director are separated by tokens, not by the
   operating system;
+- an **ACP builder** (`builder add --acp`) is the daemon's child process and runs as the daemon's account unless
+  its command switches account (for example `runas` or `sudo -u imperium-builder ...`); Imperium records an
+  ACTION event when one is added in isolation mode. For a real boundary, run ACP agents through such a command,
+  or use OpenCode over HTTP started under the builder account;
 - the builder can still change anything in its own workspace; that is why claims are verified on snapshots and why
   a check's files are hashed;
 - checks run as your account: a visible check runs code from the builder's repository (its tests). Keep the checks

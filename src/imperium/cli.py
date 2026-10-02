@@ -86,11 +86,15 @@ def _parser(err):
     bl = add("builder", "register and inspect builders")
     bsub = bl.add_subparsers(dest="builder_cmd", parser_class=_Parser)
     bsub.required = True
-    ba = bsub.add_parser("add", help="register an OpenCode session as a builder (owner)", err=err)
+    ba = bsub.add_parser("add", help="register a builder (owner): an OpenCode session, or an ACP agent Imperium "
+                                     "starts", err=err)
     ba.add_argument("name")
-    ba.add_argument("--endpoint", required=True, help="the OpenCode server, e.g. http://127.0.0.1:<port>")
-    ba.add_argument("--session", required=True, help="the OpenCode session id (ses_...)")
-    ba.add_argument("--directory", required=True, help="the session's workspace directory")
+    ba.add_argument("--endpoint", help="OpenCode: the server, e.g. http://127.0.0.1:<port>")
+    ba.add_argument("--session", help="OpenCode: the session id (ses_...)")
+    ba.add_argument("--acp", metavar="COMMAND",
+                    help="an Agent Client Protocol agent Imperium starts and owns, e.g. \"opencode acp\" or a JSON "
+                         "list; it gets a new session in --directory")
+    ba.add_argument("--directory", required=True, help="the builder's workspace directory")
     g = ba.add_mutually_exclusive_group()
     g.add_argument("--password-env", help="name of the variable holding the server password")
     g.add_argument("--password-file", help="file holding the server password")
@@ -586,6 +590,13 @@ def cmd_builder(ctx):
         return c.call("POST", f"/v1/builders/{a.builder_cmd}", {"name": a.name})
     if a.builder_cmd == "allow-version":
         return c.call("POST", "/v1/builders/allow-version", {"name": a.name, "version": a.version})
+    if a.acp:
+        if a.endpoint or a.session:
+            raise Fail(USAGE, "--acp starts its own agent; do not give --endpoint or --session with it")
+        return c.call("POST", "/v1/builders", {"adapter": "acp", "name": a.name, "command": a.acp,
+                                                "directory": os.path.abspath(a.directory)})
+    if not (a.endpoint and a.session):
+        raise Fail(USAGE, "give --endpoint and --session (an OpenCode session), or --acp COMMAND")
     body = {"name": a.name, "endpoint": a.endpoint, "session_id": a.session, "directory": a.directory,
             "check": not a.no_check}
     if a.password_env:

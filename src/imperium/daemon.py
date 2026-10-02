@@ -15,8 +15,8 @@ import threading
 import time
 import urllib.parse
 
-from . import (__version__, approvals, audit, backup, builders, config, feeds, journal, liveness, opencode, outbox,
-               paths, retention, rounds, snapshot, tokens, verify)
+from . import (__version__, acp, approvals, audit, backup, builders, config, feeds, journal, liveness, opencode,
+               outbox, paths, retention, rounds, snapshot, tokens, verify)
 from .engine import Engine
 from . import notify, transport
 from . import fsutil
@@ -158,6 +158,8 @@ def r_builders(d, principal, body, query):
 
 
 def r_builder_add(d, principal, body, query):
+    if body.get("adapter") == "acp":
+        return _builder_add_acp(d, principal, body)
     name, directory = str(_req(body, "name")), str(_req(body, "directory"))
     session_id = str(_req(body, "session_id"))
     pw_env, pw_file = body.get("password_env"), body.get("password_file")
@@ -190,6 +192,27 @@ def r_builder_add(d, principal, body, query):
                          password_env=pw_env, password_file=pw_file, version=version, caller=principal)
     _issue_builder_token(d, name)
     return {"builder": b, "builder_token": f"tokens/builder-{name}"}
+
+
+def _builder_add_acp(d, principal, body):
+    """An ACP builder: Imperium starts the agent with this command and opens a session in the directory."""
+    name, directory = str(_req(body, "name")), str(_req(body, "directory"))
+    if not os.path.isabs(directory) or not os.path.isdir(directory):
+        raise HttpError(400, "directory must be an existing absolute path")
+    try:
+        argv = acp.parse_command(_req(body, "command"))
+    except (acp.AcpError, ValueError) as e:
+        raise HttpError(400, f"command: {e}") from None
+    with d.store.tx() as conn:
+        b = builders.add(conn, name=name, endpoint=acp.endpoint_for(argv), session_id="new:" + secrets.token_hex(8),
+                         directory=directory, caller=principal, adapter="acp")
+        if d.pipes:
+            journal.append(conn, "ACP_BUILDER_RUNS_AS_DAEMON", "ACTION", builder=name,
+                           data={"note": "an ACP agent is the daemon's child and runs as its account unless its "
+                                         "command switches account; see docs/ISOLATION.md"})
+    _issue_builder_token(d, name)
+    return {"builder": b, "builder_token": f"tokens/builder-{name}",
+            "note": "the agent starts on the next cycle; its session id is recorded then"}
 
 
 def _issue_builder_token(d, name):
@@ -959,6 +982,23 @@ class _Server(socketserver.ThreadingMixIn, http.server.HTTPServer):
     daemon_threads = True
     allow_reuse_address = False
 
+    def __init__(self, *a, **kw):
+        super().__init__(*a, **kw)
+        self.slots = threading.BoundedSemaphore(transport.MAX_CONNECTIONS)
+
+    def process_request(self, request, client_address):
+        # at most MAX_CONNECTIONS at once; a held connection cannot exhaust threads (S5 review M5)
+        if not self.slots.acquire(blocking=False):
+            self.shutdown_request(request)
+            return
+        super().process_request(request, client_address)
+
+    def process_request_thread(self, request, client_address):
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self.slots.release()
+
     def server_bind(self):
         # HTTPServer.server_bind looks up socket.getfqdn(host), a reverse DNS lookup that can take many seconds
         # (it made `imperium up` time out on macOS). The address is always 127.0.0.1: no name is needed.
@@ -969,6 +1009,7 @@ class _Server(socketserver.ThreadingMixIn, http.server.HTTPServer):
 class _Handler(http.server.BaseHTTPRequestHandler):
     server_version = "imperiumd"
     sys_version = ""
+    timeout = 30  # seconds for each read or write on a real socket (TCP, Unix); pipes have their own watchdog
 
     def log_message(self, fmt, *args):
         log.debug("%s %s", self.address_string(), fmt % args)

@@ -77,6 +77,12 @@ class TransportError(RuntimeError):
     pass
 
 
+# A connection may not hold a thread forever (S5 review M5): a request must finish within REQUEST_TIMEOUT, and at
+# most MAX_CONNECTIONS are served at once per channel; more are closed at once.
+REQUEST_TIMEOUT = 120.0
+MAX_CONNECTIONS = 64
+
+
 def current_identity():
     """The account this process runs as: a SID string on Windows, a uid on Unix."""
     if os.name == "nt":
@@ -237,6 +243,7 @@ class PipeServer:
         sa.bInheritHandle = False
         self.sa = sa
         self.stop_event = threading.Event()
+        self.slots = threading.BoundedSemaphore(MAX_CONNECTIONS)
         self.first = self._instance(first=True)  # fails if anyone else already created this name
         self.thread = None
 
@@ -267,11 +274,25 @@ class PipeServer:
             if self.stop_event.is_set():
                 k32.CloseHandle(h)
                 return
-            threading.Thread(target=self._serve, args=(h,), daemon=True).start()
+            if not self.slots.acquire(blocking=False):  # too many open: refuse this one
+                k32.DisconnectNamedPipe(h)
+                k32.CloseHandle(h)
+            else:
+                threading.Thread(target=self._serve, args=(h,), daemon=True).start()
             h = self._instance()
 
     def _serve(self, h):
         served = False
+        guard, done = threading.Lock(), [False]
+
+        def expire():  # a synchronous pipe read has no timeout: disconnecting ends it
+            with guard:
+                if not done[0]:
+                    k32.DisconnectNamedPipe(h)
+
+        timer = threading.Timer(REQUEST_TIMEOUT, expire)
+        timer.daemon = True
+        timer.start()
         try:
             first = _PipeIO(h).read_some()  # the client's identity is that of the last message read
             if not first:
@@ -289,8 +310,12 @@ class PipeServer:
         finally:
             if served:  # DisconnectNamedPipe discards what the client has not read yet: wait until it has
                 k32.FlushFileBuffers(h)
+            with guard:  # after this the timer never touches the handle, which is closed next
+                done[0] = True
+            timer.cancel()
             k32.DisconnectNamedPipe(h)
             k32.CloseHandle(h)
+            self.slots.release()
 
     def stop(self):
         self.stop_event.set()
@@ -376,6 +401,7 @@ class UnixServer:
         self.sock.bind(path)
         os.chmod(path, 0o666 if channel == "builder" else 0o600)
         self.sock.listen(64)
+        self.slots = threading.BoundedSemaphore(MAX_CONNECTIONS)
         self.stop_event = threading.Event()
         self.thread = None
 
@@ -389,6 +415,10 @@ class UnixServer:
                 conn, _ = self.sock.accept()
             except OSError:
                 return
+            if not self.slots.acquire(blocking=False):
+                conn.close()
+                continue
+            conn.settimeout(30.0)
             threading.Thread(target=self._serve, args=(conn,), daemon=True).start()
 
     def _serve(self, conn):
@@ -404,6 +434,7 @@ class UnixServer:
             pass
         finally:
             conn.close()
+            self.slots.release()
 
     def stop(self):
         self.stop_event.set()

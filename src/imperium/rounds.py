@@ -169,6 +169,8 @@ def message(conn, rid, *, body, client_key, principal, now):
     r = get(conn, rid)
     if r["state"] in TERMINAL:
         raise Conflict(f"round {rid} is {r['state']}")
+    if r["state"] == PENDING:
+        raise Conflict(f"round {rid} has not started: its brief is not taken in yet")
     body = (body or "").strip()
     if not body:
         raise RoundError("a message body is required")
@@ -267,7 +269,13 @@ def report(conn, *, builder, rid, nonce, generation, state, gates=None, not_done
         raise RoundError("generation must be a number") from None
     gates, not_done, questions = _strings(gates, "gates"), _strings(not_done, "not_done"), \
         _strings(questions, "questions")
+    if channel == "mcp":
+        last_any = conn.execute("SELECT MAX(created) FROM claims WHERE round=?", (rid,)).fetchone()[0]
+        if last_any is not None and now - last_any < REPORT_MIN_INTERVAL:
+            raise TooSoon(f"at most one report every {REPORT_MIN_INTERVAL:.0f} s per round")
     if generation != r["generation"]:
+        conn.execute("INSERT INTO claims(round, generation, channel, state, digest, created) VALUES(?,?,?,?,?,?)",
+                     (rid, generation, channel, "stale", "", now))
         _event(conn, r, "STALE_CLAIM", "NOTICE", {"claimed_generation": generation, "channel": channel})
         return {"recorded": False, "reason": f"stale: the round is at generation {r['generation']}"}
     digest = hashlib.sha256(json.dumps([state, gates, not_done, questions]).encode("utf-8")).hexdigest()
@@ -408,7 +416,9 @@ def decide(conn, rid, decision, principal, note, now, workspace_tree=None, overr
             problems.append("the checks have not passed on this generation's snapshot")
         if r["verify_job"]:
             problems.append("a verification is running; wait for its result")
-        if r["cand_tree"] and workspace_tree is not None and workspace_tree != r["cand_tree"]:
+        if r["cand_tree"] and workspace_tree is None:
+            problems.append("the workspace was not compared with the verified snapshot")
+        elif r["cand_tree"] and workspace_tree != r["cand_tree"]:
             problems.append("the workspace changed since the verified snapshot; verify again")
         if problems and not override:
             raise Conflict("cannot accept: " + "; ".join(problems))
@@ -480,6 +490,9 @@ def define_check(conn, *, cid, scope, argv, working_dir, env, timeout, must_fail
     wd = (working_dir or ".").replace("\\", "/")
     if wd.startswith("/") or ".." in wd.split("/") or re.match(r"^[A-Za-z]:", wd):
         raise RoundError("working_dir must be relative to the builder's directory and stay inside it")
+    if not isinstance(depends, dict) or not all(isinstance(k, str) and isinstance(v, str)
+                                                 for k, v in depends.items()):
+        raise RoundError("depends must map each path to its hash")
     old = conn.execute("SELECT MAX(version) FROM checks WHERE id=?", (cid,)).fetchone()[0]
     if old is not None and principal != "owner":
         raise PermissionError("only the owner can change an existing check (S4 review D5)")

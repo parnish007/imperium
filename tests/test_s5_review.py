@@ -288,3 +288,136 @@ class TestSubmodules(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# --- second and third reviewers (DeepSeek, muse) -------------------------------------------------------------
+
+class TestGitInput(unittest.TestCase):
+    def repo(self):
+        ws = tempfile.mkdtemp()
+        with open(os.path.join(ws, "a.txt"), "w") as f:
+            f.write("a\n")
+        git(ws, "init", "-q")
+        git(ws, "-c", "user.name=t", "-c", "user.email=t@t", "add", "-A")
+        git(ws, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "init")
+        return ws
+
+    @unittest.skipIf(os.name == "nt", "Windows file names cannot hold a line break")
+    def test_d1_a_line_break_in_a_name_cannot_add_index_entries(self):
+        ws = self.repo()
+        blob = git(ws, "hash-object", "-w", "a.txt")
+        with open(os.path.join(ws, f"evil\n100644 {blob}\t.imperium/pwn"), "w") as f:
+            f.write("x")
+        with self.assertRaises(snapshot.SnapshotError):
+            snapshot.take(ws, "refs/imperium/t/nl")
+
+    def test_d4_hooks_in_the_old_shared_folder_never_run(self):
+        ws = self.repo()
+        hooks = os.path.join(tempfile.gettempdir(), "imperium-no-hooks")
+        os.makedirs(hooks, exist_ok=True)
+        marker = os.path.join(tempfile.mkdtemp(), "PWNED").replace("\\", "/")
+        hook = os.path.join(hooks, "reference-transaction")
+        with open(hook, "w", newline="\n") as f:
+            f.write(f"#!/bin/sh\necho x > '{marker}'\n")
+        os.chmod(hook, 0o755)
+        self.addCleanup(os.remove, hook)
+        snapshot.take(ws, "refs/imperium/t/hook")
+        self.assertFalse(os.path.exists(marker))
+
+
+class TestRelativeExecutable(unittest.TestCase):
+    def test_d6_a_relative_executable_is_hashed_from_the_checks_directory(self):
+        d = tempfile.mkdtemp()
+        script = os.path.join(d, "run.py")
+        with open(script, "w") as f:
+            f.write("print('hi')\n")
+        res = verify.run_check([os.path.join(".", "run.py")], d, [], 10, os.path.join(d, "o", "o.txt"))
+        import hashlib
+        with open(script, "rb") as f:
+            self.assertEqual(res["executable_sha256"], hashlib.sha256(f.read()).hexdigest())
+
+
+class TestRoundRules(RoundBase):
+    def test_d8_no_repair_before_the_brief_is_taken_in(self):
+        self.standing_check()
+        r = self.c.call("POST", "/v1/rounds", {"builder": "coding", "objective": "x", "client_key": "k"})["round"]
+        with self.assertRaises(Exception):
+            self.c.call("POST", "/v1/rounds/message", {"id": r["id"], "body": "fix", "client_key": "m1"})
+
+    def test_d5_stale_reports_are_rate_limited(self):
+        self.standing_check()
+        rid, nonce = self.open()
+        self.report(rid, nonce, gen=7)
+        with self.assertRaises(Exception):  # within 10 s: refused, not journaled again
+            self.b.call("POST", "/v1/builder/report", {"round": rid, "nonce": nonce, "generation": 7,
+                                                       "state": "ready"})
+        self.assertEqual(self.types().count("STALE_CLAIM"), 1)
+
+    def test_d2_accept_needs_a_workspace_comparison(self):
+        self.standing_check()
+        rid, nonce = self.open()
+        with self.h.d.store.tx() as conn:
+            conn.execute("UPDATE rounds SET state='VERIFIED', cand_tree='t', cand_generation=1, "
+                         "checks_ok_generation=1 WHERE id=?", (rid,))
+            with self.assertRaises(rounds.Conflict):
+                rounds.decide(conn, rid, "accept", "owner", "", self.now)
+
+    def test_d7_depends_must_be_a_map(self):
+        with self.h.d.store.tx() as conn:
+            with self.assertRaises(rounds.RoundError):
+                rounds.define_check(conn, cid="x", scope="builder:coding", argv=[PY], working_dir=".", env=[],
+                                    timeout=10, must_fail_on_base=False, depends=[], required=True,
+                                    principal="owner")
+
+
+class TestApprovalMatching(ApprovalBase):
+    def test_m3_an_ask_without_patterns_is_never_allowed_by_a_rule(self):
+        self.rule(pattern="*")
+        self.director().call("POST", "/v1/director/presence", {})
+        aid = self.ask(patterns=[])
+        self.assertEqual(self.approval(aid)["state"], "PENDING")
+
+    @unittest.skipUnless(os.name == "nt", "Windows spelling")
+    def test_m2_a_deny_rule_is_not_dodged_by_case_or_separators(self):
+        self.rule(permission="*", pattern="*")
+        self.rule(permission="*", pattern="C:\secret\*", decision="deny")
+        self.director().call("POST", "/v1/director/presence", {})
+        aid = self.ask(permission="edit", patterns=["C:/SECRET/payload"])
+        self.assertEqual(self.approval(aid)["state"], "REJECTED")
+
+    def test_m1_answers_follow_the_question(self):
+        q = self.fake.add_question("ses_a1", options=("A", "B"))
+        self.cycle()
+        with self.assertRaises(Exception):  # an empty answer
+            self.c.call("POST", "/v1/questions/answer", {"id": q["id"], "answers": [[]]})
+        with self.h.d.store.tx() as conn:  # a question that allows only its own options
+            conn.execute("UPDATE questions SET shape=? WHERE id=?",
+                         (json.dumps([{"header": "h", "multiple": False, "custom": False, "options": ["A", "B"]}]),
+                          q["id"]))
+        with self.assertRaises(Exception):
+            self.c.call("POST", "/v1/questions/answer", {"id": q["id"], "answers": [["maybe"]]})
+        self.c.call("POST", "/v1/questions/answer", {"id": q["id"], "answers": [["A"]]})
+
+
+class TestConnections(unittest.TestCase):
+    def test_m5_an_idle_connection_is_closed_and_the_count_is_bounded(self):
+        import socket
+        from helpers import TempHome
+        from imperium import daemon
+        h = TempHome("[opencode]\npoll_interval = 3600.0\n").init().start()
+        self.addCleanup(h.cleanup)
+        old = daemon._Handler.timeout
+        daemon._Handler.timeout = 1
+        self.addCleanup(setattr, daemon._Handler, "timeout", old)
+        s = socket.create_connection(("127.0.0.1", h.d.port))
+        s.sendall(b"POST /v1/status HTTP/1.1\r\nHost: x\r\nContent-Length: 100\r\n\r\n")  # never finishes
+        s.settimeout(10)
+        started = time.monotonic()
+        try:
+            data = s.recv(100)
+        except OSError:
+            data = b""
+        self.assertLess(time.monotonic() - started, 9)  # the server gave up on it
+        s.close()
+        self.assertTrue(h.d.server.slots.acquire(blocking=False))  # its slot came back
+        h.d.server.slots.release()

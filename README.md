@@ -75,6 +75,9 @@ imperium up                        # start the background service (idempotent)
 imperium builder add coding --endpoint http://127.0.0.1:<port> --session <ses_id> --directory <repo>
 imperium builder mcp-config coding --write    # adds Imperium's builder tool; restart OpenCode while idle
 
+# or let Imperium start any Agent Client Protocol agent itself (it gets the builder tool automatically)
+imperium builder add helper --acp "opencode acp" --directory <repo>
+
 # a trusted check: Imperium runs it on a snapshot, never in the live workspace
 imperium check add unit --builder coding --depends tests/test_calc.py --must-fail-on-base -- python -m pytest -q
 
@@ -140,8 +143,9 @@ The details, and what each guarantee does *not* cover, are in [docs/SPEC.md](doc
 | 8 | Claude Code plugin and the director's playbook | **done** |
 | 9 | Read-only dashboard | **done** |
 | — | Isolation mode (Windows pipes, Unix sockets), owner notifications, CI on three systems | **done** |
+| — | Second adapter: any Agent Client Protocol agent (OpenCode, Gemini CLI, Claude Code, Codex via ACP) | **done** |
 
-Next: more builder adapters (Claude Code, Codex, ACP), dashboard actions.
+Next: dashboard actions; questions from ACP agents.
 
 ## Testing
 

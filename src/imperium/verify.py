@@ -32,7 +32,10 @@ class VerifyError(RuntimeError):
 def run_check(argv, cwd, env_names, timeout, out_path, secrets=()):
     """Run one check. Returns provenance; never raises for the check's own failure."""
     env = {k: v for k, v in os.environ.items() if k.upper() in BASE_ENV or k in env_names}
-    exe = shutil.which(argv[0], path=env.get("PATH") or env.get("Path")) or argv[0]
+    if os.path.dirname(argv[0]):  # a path ("./run.sh", "tools/check"): relative to the check's directory
+        exe = argv[0] if os.path.isabs(argv[0]) else os.path.normpath(os.path.join(cwd, argv[0]))
+    else:
+        exe = shutil.which(argv[0], path=env.get("PATH") or env.get("Path")) or argv[0]
     exe_hash = None
     try:
         with open(exe, "rb") as f:
@@ -282,6 +285,7 @@ class Verifier:
             return self._finish(rid, job, error=f"snapshot failed: {e}")
         with self.d.store.tx() as conn:
             outbox.release(conn, r["builder"], holder)
+            rounds.void_verification(conn, rid, clock(), "a new candidate snapshot was taken")
             conn.execute("UPDATE rounds SET cand_commit=?, cand_tree=?, cand_generation=?, untrusted=0, "
                          "checks_ok_generation=NULL, updated=? WHERE id=?",
                          (snap["commit"], snap["tree"], gen, clock(), rid))

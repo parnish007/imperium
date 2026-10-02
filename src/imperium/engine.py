@@ -16,7 +16,7 @@ import os
 import threading
 import time
 
-from . import approvals, builders, journal, liveness, opencode, outbox, rounds, snapshot
+from . import acp, approvals, builders, journal, liveness, opencode, outbox, rounds, snapshot
 from .reader import Reader
 from .store import StoreFailed, meta_get
 
@@ -33,6 +33,7 @@ class Engine:
         self.lock = threading.Lock()
         self.stop_event = threading.Event()
         self.health = {}
+        self.acp = {}  # builder name -> acp.Connection (agent processes Imperium owns)
         self.thread = None
 
     def start(self):
@@ -43,6 +44,9 @@ class Engine:
         self.stop_event.set()
         if self.thread:
             self.thread.join(30)
+        for conn in list(self.acp.values()):
+            conn.close()
+        self.acp.clear()
 
     def _loop(self):
         while not self.stop_event.wait(self.cfg["poll_interval"]):
@@ -78,6 +82,8 @@ class Engine:
             with self.d.store.read() as conn:
                 rows = builders.list_(conn)
             secrets = self.secrets(rows)
+            for name in set(self.acp) - {b["name"] for b in rows if b["adapter"] == "acp"}:
+                self.acp.pop(name).close()  # removed builders' agents are stopped
             for b in rows:
                 if self.stop_event.is_set():
                     return
@@ -95,15 +101,21 @@ class Engine:
                                           "last_error": None})
         if h.get("halted") or (respect_backoff and time.monotonic() < h["next"]):
             return
-        try:
-            pw = builders.password(b)
-        except OSError as e:
-            self._fail(b, h, "credential", f"cannot read the password file: {e.strerror}")
-            return
-        client = opencode.OpenCodeClient(b["endpoint"], directory=b["directory"], password=pw,
-                                         timeout=self.cfg["timeout"])
-        reader = Reader(client, b, secrets=secrets, page_size=self.cfg["page_size"],
-                        max_scan_pages=self.cfg["max_scan_pages"], partless_polls=self.cfg["partless_polls"])
+        if b["adapter"] == "acp":
+            conn = self.acp.get(name)
+            if conn is None:
+                conn = self.acp[name] = acp.Connection(b, self.d.home, secrets)
+            client = reader = conn
+        else:
+            try:
+                pw = builders.password(b)
+            except OSError as e:
+                self._fail(b, h, "credential", f"cannot read the password file: {e.strerror}")
+                return
+            client = opencode.OpenCodeClient(b["endpoint"], directory=b["directory"], password=pw,
+                                             timeout=self.cfg["timeout"])
+            reader = Reader(client, b, secrets=secrets, page_size=self.cfg["page_size"],
+                            max_scan_pages=self.cfg["max_scan_pages"], partless_polls=self.cfg["partless_polls"])
         with self.d.store.read() as conn:
             r = conn.execute("SELECT data FROM checkpoints WHERE builder=?", (name,)).fetchone()
         cp = json.loads(r[0]) if r else None
@@ -203,7 +215,10 @@ class Engine:
         if cp.get("phase") is not None:
             return "still reading history"
         v = cp.get("version")
-        if v not in opencode.TESTED_VERSIONS and v != b["allowed_version"]:
+        if b["adapter"] == "acp":
+            if cp.get("protocol") != acp.PROTOCOL_VERSION:
+                return f"ACP protocol {cp.get('protocol')} is not supported"
+        elif v not in opencode.TESTED_VERSIONS and v != b["allowed_version"]:
             return f"OpenCode {v} is untested; the owner may run `imperium builder allow-version`"
         if cp.get("permissions") is None:
             return "permission state unknown"
@@ -417,12 +432,41 @@ class Engine:
                     approvals.observe_question(conn, b["name"], o["raw"], self.clock())
                 elif o["type"] == "QUESTION_GONE":
                     approvals.question_gone(conn, o["data"]["question_id"])
+                elif o["type"].startswith("ACP_"):
+                    self._acp_observed(conn, b, o)
             conn.execute("INSERT INTO checkpoints(builder, data, updated) VALUES(?,?,?) "
                          "ON CONFLICT(builder) DO UPDATE SET data=excluded.data, updated=excluded.updated",
                          (b["name"], json.dumps(cp), journal.now()))
             if cp.get("version") and cp.get("version") != b.get("opencode_version"):
                 conn.execute("UPDATE builders SET opencode_version=? WHERE name=?", (cp["version"], b["name"]))
                 b["opencode_version"] = cp["version"]
+
+    def _acp_observed(self, conn, b, o):
+        d = o["data"]
+        if o["type"] == "ACP_SESSION_CREATED":
+            conn.execute("UPDATE builders SET session_id=? WHERE name=?", (d["session_id"], b["name"]))
+            b["session_id"] = d["session_id"]
+        elif o["type"] == "ACP_PROMPT_REFUSED":
+            m = outbox.by_oc_id(conn, b["name"], d["message_id"])
+            if m is not None and m["state"] == outbox.POSTED:
+                outbox.transition(conn, m["id"], outbox.REJECTED, event="MSG_REJECTED", severity="ACTION",
+                                  data={"note": "the agent answered with an error before any activity",
+                                        "code": d.get("code")})
+        elif o["type"] in ("ACP_HISTORY_TOKEN", "ACP_HISTORY_RAN"):
+            # a replayed history (session/load) holds our header: proof, resolved to the message's own id
+            try:
+                m = outbox.get(conn, d["token_msg"])
+            except outbox.OutboxError:
+                return
+            if m["builder"] != b["name"] or not m["oc_message_id"]:
+                return
+            if o["type"] == "ACP_HISTORY_TOKEN":
+                outbox.observed_user(conn, b["name"], m["oc_message_id"], m["id"], self.clock())
+                conn_ = self.acp.get(b["name"])
+                if conn_ is not None:
+                    conn_.seen.add(m["oc_message_id"])
+            else:
+                outbox.observed_turn(conn, b["name"], m["oc_message_id"], self.clock())
 
     def _event(self, b, type_, severity, data=None):
         try:

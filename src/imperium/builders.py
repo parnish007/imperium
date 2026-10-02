@@ -42,16 +42,18 @@ def get(conn, name):
     return _row(r)
 
 
-def validate(name, endpoint):
+def validate(name, endpoint, adapter="opencode-http"):
     if not NAME.match(name or ""):
         raise BuilderError("a builder name is 1-32 characters: lowercase letters, digits, '-' and '_', "
                            "starting with a letter or digit")
+    if adapter == "acp":
+        return endpoint  # "acp:" + the command as JSON (acp.endpoint_for)
     return opencode.canonical_endpoint(endpoint)
 
 
 def add(conn, *, name, endpoint, session_id, directory, password_env=None, password_file=None, version=None,
-        caller="owner"):
-    endpoint = validate(name, endpoint)
+        caller="owner", adapter="opencode-http"):
+    endpoint = validate(name, endpoint, adapter)
     if conn.execute("SELECT 1 FROM builders WHERE name=?", (name,)).fetchone():
         raise Conflict(f"a builder named {name!r} already exists")
     dup = conn.execute("SELECT name FROM builders WHERE adapter='opencode-http' AND endpoint=? AND session_id=?",
@@ -64,10 +66,10 @@ def add(conn, *, name, endpoint, session_id, directory, password_env=None, passw
                            "two builders in one workspace are not supported in v1")
     conn.execute("INSERT INTO builders(name, adapter, endpoint, session_id, directory, password_env, password_file, "
                  "opencode_version, allowed_version, paused, created) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
-                 (name, "opencode-http", endpoint, session_id, directory, password_env, password_file, version,
+                 (name, adapter, endpoint, session_id, directory, password_env, password_file, version,
                   None, 0, journal.now()))
     journal.append(conn, "BUILDER_ADDED", "NOTICE", builder=name, caller=caller,
-                   data={"endpoint": endpoint, "session_id": session_id, "directory": directory,
+                   data={"adapter": adapter, "endpoint": endpoint, "session_id": session_id, "directory": directory,
                          "opencode_version": version,
                          "credential": "env:" + password_env if password_env else
                          ("file" if password_file else "none")})

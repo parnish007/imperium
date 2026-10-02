@@ -76,6 +76,22 @@ status idle for `idle_stable_polls` polls; no reply or user message still being 
 only the owner's messages); free resources if the message asked for them. Messages from the owner go first.
 A queue blocked for `stall_alert` (600 s) raises one `DISPATCH_STALLED` ACTION event saying why.
 
+### 3.3 Builder adapters
+
+- **OpenCode over HTTP** (`builder add NAME --endpoint URL --session ID`): Imperium attaches to a session of a
+  running `opencode serve`, which a person may also use. Proof and states as above.
+- **Agent Client Protocol** (`builder add NAME --acp "opencode acp" --directory DIR`; any ACP agent: OpenCode,
+  Gemini CLI, Claude Code or Codex through their ACP adapters): Imperium starts the agent as its own child process,
+  opens a session in the directory with the builder's MCP tool, and restarts the agent if it exits. The agent's
+  first turn activity after a prompt (a message, thought, plan or tool call) or its answer to the prompt is proof
+  of delivery and of the run; updates that can arrive at any time (commands, modes, usage) are not. An error answer
+  before any activity is REJECTED. After a restart an agent that can load sessions replays its history, and
+  Imperium's own header in it is proof (FOUND_LATE); an agent that cannot load or resume gets a new session and
+  `ACP_SESSION_LOST` says so. Permission requests become approvals: tool kinds map to `bash` (execute), `edit`
+  (edit, delete, move), `webfetch` (fetch), else the kind; patterns are the paths a tool touches, else its
+  command, else its title. A reply selects the agent's own option of that kind; if there is none, the request is
+  answered `cancelled`, never allowed by guessing. Imperium offers the agent no file system or terminal of its own.
+
 ## 4. Rounds
 
 ```
@@ -126,8 +142,9 @@ a submodule's own changes would be invisible to the snapshot. Plain `git push` d
 ## 5. Approvals and questions
 
 - OpenCode's own permission configuration decides first; only its `ask` cases reach Imperium. An ask is stored
-  with at most 50 patterns of 2,000 characters; an ask that may have been cut is never answered by an allow rule
-  (deny rules still apply).
+  with at most 50 patterns of 2,000 characters; an ask that may have been cut, or has no patterns, is never
+  answered by an allow rule (deny rules still apply). On Windows a deny rule also matches regardless of case and
+  of `/` or `\`; allow rules match exactly.
 - **Rules** (*owner*): permission glob, pattern glob, optional `path_under` directory, allow or deny, optional
   builder. Deny wins. An allow rule must cover every pattern of the ask; a deny rule fires on any one.
 - **Automatic answers** happen only while the registered director is **present**: one of its own calls (reading or
@@ -140,8 +157,8 @@ a submodule's own changes would be invisible to the snapshot. Plain `git push` d
 - **Replies are operations:** committed with the decision, sent, retried every cycle (also after a restart) until
   OpenCode confirms or no longer lists the ask. Under stop-all or quarantine only rejections are sent; a decided
   `once` or an answer waits for `resume-all`. An ask OpenCode stops listing while undecided is EXPIRED.
-- **Questions** are answered by hand with OpenCode's structure: one list of chosen labels per question; a
-  single-choice question takes one label.
+- **Questions** are answered by hand with OpenCode's structure: one non-empty list of chosen labels per question;
+  a single-choice question takes one label; a question that does not allow typed answers takes only its options.
 - **Path rules** are a tripwire: while a builder can run shell commands it can reach any path, and a symlink can
   change between the decision and the use. The comparison is case-insensitive on Windows, refuses UNC paths, 8.3
   short names and `~`, resolves existing paths, and respects the separator boundary.
@@ -193,7 +210,8 @@ swapped in one rename), and starts observe-only until the owner confirms.
 - **CLI** `imperium …` with `--json` everywhere; exit codes 0 ok, 1 error, 2 usage, 3 daemon not running,
   4 refused, 5 integrity or doctor failure.
 - **Local API** on 127.0.0.1, random port written to `daemon.json`; Host and Origin checks; bearer tokens in a
-  header (never cookies); per-principal rate limits; a capped call-audit table.
+  header (never cookies); per-principal rate limits; a capped call-audit table. At most 64 connections per
+  channel at once; a read or write that waits 30 s ends the connection (on a pipe, a request has 120 s).
 - **Director MCP** (`imperium mcp`) and **builder MCP** (`imperium builder-mcp`): stdio, JSON-RPC 2.0, standard
   library only. Read-only tools carry `readOnlyHint`.
 - **Claude Code plugin** (`imperium plugin write <dir>`): the `imperium` skill (the playbook), the director MCP
@@ -203,5 +221,5 @@ swapped in one rename), and starts observe-only until the owner confirms.
 
 ## 10. Not yet
 
-Adapters other than OpenCode over HTTP; pulling
+Questions from ACP agents (elicitation); pulling
 work instead of pushing it (needs a fetch that also claims); dashboard actions.

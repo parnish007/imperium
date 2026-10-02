@@ -32,9 +32,9 @@ class SnapshotError(RuntimeError):
 
 
 def _git(args, cwd, env=None, check=True, timeout=300, data=None, raw=False):
-    hooks = os.path.join(tempfile.gettempdir(), "imperium-no-hooks")
-    os.makedirs(hooks, exist_ok=True)
-    full = ["git", "-c", f"core.hooksPath={hooks}"] + SAFE + args
+    # Hooks are looked up under the null device, where nothing can exist. (A directory in the temp folder could
+    # be created first by another account and filled with hooks: S5 review D4.)
+    full = ["git", "-c", f"core.hooksPath={os.devnull}"] + SAFE + args
     e = dict(os.environ)
     for k in ("GIT_INDEX_FILE", "GIT_DIR", "GIT_WORK_TREE", "GIT_EXTERNAL_DIFF", "GIT_CONFIG_PARAMETERS"):
         e.pop(k, None)
@@ -106,6 +106,11 @@ def tree_of_worktree(top):
                                 "submodule's repository on its own")
         listed = _git(["ls-files", "-z", "--cached", "--others", "--exclude-standard"], top, env, raw=True)
         paths = sorted({p.decode("utf-8", "surrogateescape") for p in listed.split(b"\0") if p})
+        odd = [p for p in paths if "\n" in p or "\r" in p]
+        if odd:
+            # git reads the lists below one name per line: a line break in a name would add entries of the
+            # builder's choosing (S5 review D1)
+            raise SnapshotError(f"a file name contains a line break ({odd[0]!r}); rename it to verify")
         remove, files, links = [], [], []
         for p in paths:
             if _excluded(p):
@@ -143,8 +148,8 @@ def tree_of_worktree(top):
             _git(["update-index", "--force-remove", "-z", "--stdin"], top, env,
                  data=b"\0".join(p.encode("utf-8", "surrogateescape") for p in remove) + b"\0")
         if lines:
-            _git(["update-index", "--index-info"], top, env,
-                 data=("\n".join(lines) + "\n").encode("utf-8", "surrogateescape"))
+            _git(["update-index", "-z", "--index-info"], top, env,
+                 data=("\0".join(lines) + "\0").encode("utf-8", "surrogateescape"))
         tree = _git(["write-tree"], top, env)
         return tree, head, len(files) + len(links)
     finally:

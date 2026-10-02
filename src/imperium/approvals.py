@@ -100,8 +100,14 @@ def _rule_matches(rule, a, workspace):
     if not fnmatch.fnmatchcase(a["permission"] or "", rule["permission"]):
         return False
     hits = []
+    if not a["patterns"] and rule["decision"] == "allow":
+        return False  # nothing to check the rule against: decided by hand (S5 review M3)
     for p in a["patterns"] or [""]:
         hit = fnmatch.fnmatchcase(p, rule["pattern"])
+        if not hit and rule["decision"] == "deny" and os.name == "nt":
+            # Windows names ignore case and accept either separator: a deny must not be dodged by spelling
+            # (S5 review M2). Allow rules stay exact, so folding can only make Imperium stricter.
+            hit = fnmatch.fnmatchcase(_fold(p), _fold(rule["pattern"]))
         if hit and rule["path_under"]:
             hit = path_within(p if os.path.isabs(p) else os.path.join(workspace, p), rule["path_under"])
         hits.append(hit)
@@ -116,6 +122,10 @@ def maybe_cut(a):
     """True if the stored patterns may be shorter than what the builder asked (they are capped when stored)."""
     pats = a["patterns"] or []
     return len(pats) >= MAX_PATTERNS or any(len(p) >= MAX_PATTERN_LEN for p in pats)
+
+
+def _fold(s):
+    return s.replace("/", "\\").lower()
 
 
 def evaluate(conn, a, workspace):
@@ -283,6 +293,7 @@ def observe_question(conn, builder, q, now):
     if conn.execute("SELECT 1 FROM questions WHERE id=?", (q["id"],)).fetchone():
         return
     shapes = [{"header": str(x.get("header", ""))[:200], "multiple": bool(x.get("multiple")),
+               "custom": x.get("custom") is not False,
                "options": [str(o.get("label", ""))[:200] for o in (x.get("options") or [])][:50]}
               for x in (q.get("questions") or [])][:20]
     conn.execute("INSERT INTO questions(id, builder, shape, state, reply_state, created) VALUES(?,?,?,?, 'none', ?)",
@@ -320,8 +331,13 @@ def answer(conn, qid, answers, principal, now, reject=False):
                 or not all(isinstance(a, list) and all(isinstance(x, str) for x in a) for a in answers)):
             raise ApprovalError(f"answers must be {len(q['shape'])} list(s) of chosen labels, one per question")
         for a, shape in zip(answers, q["shape"]):
+            if not a or any(not x.strip() for x in a):
+                raise ApprovalError(f"question {shape['header']!r} needs an answer")
             if not shape["multiple"] and len(a) > 1:
                 raise ApprovalError(f"question {shape['header']!r} takes one answer")
+            if shape.get("custom") is False and not set(a) <= set(shape["options"]):
+                raise ApprovalError(f"question {shape['header']!r} takes only its own options: "
+                                    + ", ".join(shape["options"][:10]))
     conn.execute("UPDATE questions SET state=?, answers=?, decided_by=?, reply_state='pending', decided_at=? "
                  "WHERE id=?", (REJECTED if reject else ANSWERED, json.dumps(answers), principal, now, qid))
     journal.append(conn, "QUESTION_REJECTED" if reject else "QUESTION_ANSWERED", "INFO", builder=q["builder"],
