@@ -108,8 +108,8 @@ untouched), kept under `refs/imperium/...` so garbage collection keeps them. `.i
 The builder controls its repository's `.git/config` and `.gitattributes`, so nothing Imperium runs there may execute
 them: files are hashed raw (`hash-object --no-filters`, never `git add`), a check's copy is written from raw object
 contents (never a checkout or `git archive`, which apply smudge filters), diffs run with `--no-ext-diff
---no-textconv`, commits are never signed, hooks and fsmonitor are off. Plain `git push` does not send `refs/imperium/*`; `git push --mirror`
-would.
+--no-textconv`, commits are never signed, hooks and fsmonitor are off. Plain `git push` does not send
+`refs/imperium/*`; `git push --mirror` would.
 
 ## 5. Approvals and questions
 

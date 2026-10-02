@@ -8,7 +8,8 @@ refs; `git push --mirror` would.
 The repository belongs to the builder, and so do its `.git/config` and `.gitattributes`. No git command here may
 run anything the builder configured (under isolation mode that would be code execution as the owner):
 - files are hashed with `hash-object --no-filters`, never `git add` (clean filters);
-- a check's copy is extracted from `git archive` by Python, never checked out (smudge filters, hooks);
+- a check's copy is written by Python from raw object contents (`cat-file --batch`), never checked out or
+  archived (both apply smudge filters; checkout also runs hooks);
 - diffs use `--no-ext-diff --no-textconv`; commits are never signed (`gpg.program`); hooks and fsmonitor are off.
 `.imperium/` (round briefs and claim files) is excluded from every snapshot.
 """
@@ -191,8 +192,8 @@ def diff(top, base_commit, cand):
 
 
 class Worktree:
-    """A temporary copy of a commit's files, extracted from `git archive` by Python (nothing in the repository's
-    configuration runs), removed on exit."""
+    """A temporary copy of a commit's files, written by Python from raw object contents (nothing in the
+    repository's configuration runs), removed on exit."""
 
     def __init__(self, top, commit):
         self.top, self.commit = top, commit
