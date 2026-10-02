@@ -1,12 +1,15 @@
 """Isolation mode: the API over OS-permissioned channels with the peer identified by the operating system.
 
-On Windows: named pipes with an access list. The tests run as one account, so both channels admit it; they check
-the binding of tokens to channels, the refusal of TCP for anything but the read-only dashboard, the access list
-(an account not on it cannot even open the pipe), and refusal to share a pipe name someone else created first.
+Windows: named pipes with an access list; Linux and macOS: Unix sockets with a peer-uid check. The tests run as
+one account, so both channels admit it; they check the binding of tokens to channels, the refusal of TCP for
+anything but the read-only dashboard, the per-connection peer check, and the refusal to share an endpoint someone
+else prepared first.
 """
+import http.server
 import io
 import json
 import os
+import shutil
 import unittest
 
 from fake_opencode import FakeOpenCode
@@ -22,8 +25,7 @@ def run(home, *args, env=None):
     return rc, (json.loads(out.getvalue()) if out.getvalue().strip() else None)
 
 
-@unittest.skipUnless(WINDOWS, "named pipes are the Windows transport")
-class TestPipes(unittest.TestCase):
+class TestChannels(unittest.TestCase):
     def setUp(self):
         me = transport.current_identity()
         cfg = (f'[opencode]\npoll_interval = 3600.0\n[isolation]\nowner_accounts = ["{me}"]\n'
@@ -40,6 +42,7 @@ class TestPipes(unittest.TestCase):
         rc, body = run(self.h.home, "status")
         self.assertEqual(rc, 0, body)
         self.assertEqual(body["transport"], "pipe:owner")
+        self.assertTrue(body["isolation"])
         with self.assertRaises(client.ApiError) as e:
             self.h.client().call("GET", "/v1/status", via_tcp=True)
         self.assertEqual(e.exception.status, 403)
@@ -65,7 +68,8 @@ class TestPipes(unittest.TestCase):
         old_raw = tokens.read_locator(self.h.home, "builder:coding")
         rc, body = run(self.h.home, "builder", "mcp-config", "coding", "--isolated", path)
         self.assertEqual(rc, 0, body)
-        cfg = json.load(open(path, encoding="utf-8"))["mcp"]["imperium"]
+        with open(path, encoding="utf-8") as f:
+            cfg = json.load(f)["mcp"]["imperium"]
         self.assertNotIn("--home", cfg["command"])
         # a builder under its own account: a runtime folder it cannot read, only its config's environment
         b = client.Client(os.path.join(self.h.tmp.name, "no-such-home"), principal="builder:coding",
@@ -86,49 +90,80 @@ class TestPipes(unittest.TestCase):
         self.assertIn("builders", c.call("GET", "/v1/status", via_tcp=True))
 
 
-@unittest.skipUnless(WINDOWS, "named pipes are the Windows transport")
-class TestPipeAccessList(unittest.TestCase):
-    def test_a_peer_account_the_channel_does_not_admit_is_refused(self):
-        import http.server
-        name = r"\\.\pipe\imperium-test-" + os.urandom(4).hex()
+class _Hello(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"hi")
 
-        class H(http.server.BaseHTTPRequestHandler):
-            def do_GET(self):
-                self.send_response(200)
-                self.end_headers()
-                self.wfile.write(b"hi")
+    def log_message(self, *a):
+        pass
 
-            def log_message(self, *a):
-                pass
 
-        # only the Guests group may connect (and the daemon's own account, which is us: so use a raw check)
-        srv = transport.PipeServer(name, ["S-1-5-32-546"], H, None, "test")
+REQ = b"GET / HTTP/1.0\r\nHost: x\r\n\r\n"
+
+
+class TestPeerCheck(unittest.TestCase):
+    def endpoint(self):
+        if WINDOWS:
+            return r"\\.\pipe\imperium-test-" + os.urandom(4).hex()
+        d = os.path.join("/tmp", "imperium-t-" + os.urandom(4).hex())
+        self.addCleanup(shutil.rmtree, d, True)
+        return os.path.join(d, "x.sock")
+
+    def server(self, name, allowed, channel="owner"):
+        cls = transport.PipeServer if WINDOWS else transport.UnixServer
+        srv = cls(name, allowed, _Hello, None, channel)
         srv.start()
-        try:
-            # The access list admits the daemon's own account (us), so we can open the pipe; the server must still
-        # refuse us because the channel admits only Guests. (A second real account is needed to see the access
-        # list itself refuse the open; that is part of the isolation setup check, not this suite.)
-            with self.assertRaises(Exception):
-                transport.pipe_request(name, b"GET / HTTP/1.0\r\nHost: x\r\n\r\n", timeout_ms=2000)
-        finally:
-            srv.stop()
+        self.addCleanup(srv.stop)
+        return srv
 
-    def test_refuses_a_name_someone_else_created_first(self):
-        import http.server
-        name = r"\\.\pipe\imperium-test-" + os.urandom(4).hex()
+    def test_an_admitted_account_is_served(self):
+        name = self.endpoint()
+        self.server(name, [transport.current_identity()])
+        status, body = transport.request(name, REQ, timeout_ms=3000)
+        self.assertEqual((status, body), (200, b"hi"))
+
+    def test_a_peer_account_the_channel_does_not_admit_is_refused(self):
+        # The daemon's own account may open the endpoint (it is us); the per-connection check must still refuse us
+        # because the channel admits only another account. (Seeing the operating system itself refuse the open
+        # needs a second real account: that is step 7 of docs/ISOLATION.md, not this suite.)
+        name = self.endpoint()
+        self.server(name, ["S-1-5-32-546" if WINDOWS else "99999"])
+        with self.assertRaises(Exception):
+            transport.request(name, REQ, timeout_ms=2000)
+
+    def test_refuses_an_endpoint_someone_else_prepared(self):
+        name = self.endpoint()
         me = transport.current_identity()
-        first = transport.PipeServer(name, [me], http.server.BaseHTTPRequestHandler, None, "a")
-        try:
-            with self.assertRaises(transport.TransportError):
-                transport.PipeServer(name, [me], http.server.BaseHTTPRequestHandler, None, "b")
-        finally:
-            first.stop()
+        if WINDOWS:
+            self.server(name, [me])  # the first instance holds the name
+        else:
+            os.makedirs(os.path.dirname(name))
+            os.chmod(os.path.dirname(name), 0o777)  # writable by others: could hold a planted socket
+        with self.assertRaises(transport.TransportError):
+            (transport.PipeServer if WINDOWS else transport.UnixServer)(name, [me], _Hello, None, "b")
 
+
+@unittest.skipUnless(WINDOWS, "access lists are the Windows mechanism")
+class TestAccessList(unittest.TestCase):
     def test_sddl_is_protected_and_lists_only_the_given_accounts(self):
         d = transport.sddl(["S-1-5-21-1-2-3-1001"])
         self.assertTrue(d.startswith("D:P(A;;GA;;;SY)"))
         self.assertIn("(A;;GA;;;S-1-5-21-1-2-3-1001)", d)
         self.assertNotIn("WD", d)  # never Everyone
+
+
+@unittest.skipIf(WINDOWS, "Unix sockets")
+class TestUnixSocket(unittest.TestCase):
+    def test_owner_socket_is_private_and_directory_not_listable(self):
+        d = os.path.join("/tmp", "imperium-t-" + os.urandom(4).hex())
+        self.addCleanup(shutil.rmtree, d, True)
+        srv = transport.UnixServer(os.path.join(d, "owner.sock"), [transport.current_identity()], _Hello, None,
+                                   "owner")
+        self.addCleanup(srv.stop)
+        self.assertEqual(os.stat(d).st_mode & 0o777, 0o711)
+        self.assertEqual(os.stat(srv.name).st_mode & 0o777, 0o600)
 
 
 if __name__ == "__main__":

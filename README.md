@@ -51,7 +51,7 @@ Imperium's job is to make each of these visible and recoverable.
 ## Security model: read this
 
 - **Imperium is not a sandbox.** A builder running as your OS user can do anything you can, including reading Imperium's files and acting as the director. A builder hijacked by a malicious web page (prompt injection) is a realistic way for that to happen. If you need containment, run builders as another OS user, in a container or in a VM.
-- **"Owner-only" is enforced against software that follows the protocol, not against a hostile process.** The owner's token is a file in your runtime folder; any program running as your OS user, including a builder, can read it and act as the owner. A real boundary needs the builder under another OS user, in a container or a VM. **Isolation mode** (Windows) runs builders under their own account and admits them only through a named pipe that the operating system guards: see [docs/ISOLATION.md](docs/ISOLATION.md). Linux and macOS support is not done yet.
+- **"Owner-only" is enforced against software that follows the protocol, not against a hostile process.** The owner's token is a file in your runtime folder; any program running as your OS user, including a builder, can read it and act as the owner. A real boundary needs the builder under another OS user, in a container or a VM. **Isolation mode** runs builders under their own account and admits them only through a channel the operating system guards (a named pipe on Windows, a Unix socket on Linux and macOS; the account at the other end is checked on every connection): see [docs/ISOLATION.md](docs/ISOLATION.md).
 - The local API listens on `127.0.0.1` only, checks the `Host` and `Origin` headers (these stop web pages, not local programs), and needs a 256-bit bearer token. Tokens are stored hashed; the runtime folder is readable only by your user.
 - The journal's hash chain detects accidental corruption and naive edits. A process running as the same user could recompute it, so it is an integrity check, not proof.
 
@@ -138,7 +138,7 @@ The details, and what each guarantee does *not* cover, are in [docs/SPEC.md](doc
 | 8 | Claude Code plugin and the director's playbook | **done** |
 | 9 | Read-only dashboard | **done** |
 
-Next: isolation mode on Linux and macOS, more builder adapters (Claude Code, Codex, ACP), owner notifications, dashboard actions.
+Next: more builder adapters (Claude Code, Codex, ACP), owner notifications, dashboard actions.
 
 ## Testing
 

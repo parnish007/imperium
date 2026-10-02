@@ -18,9 +18,9 @@ back from it to the owner's token.
 
 **Limit, stated plainly:** by default every actor runs as the same operating-system user. A process that ignores
 the protocol (a builder running shell commands) can read the token files and the database. "Owner-only" therefore
-holds against software that follows the protocol, not against a hostile builder. **Isolation mode** (Windows, see
-[ISOLATION.md](ISOLATION.md)) runs builders under their own account: the API is reached through named pipes whose
-access lists admit only the configured accounts, the operating system identifies the account at the other end of
+holds against software that follows the protocol, not against a hostile builder. **Isolation mode** (see
+[ISOLATION.md](ISOLATION.md)) runs builders under their own account: the API is reached through named pipes
+(Windows, with access lists) or Unix sockets (Linux and macOS) that admit only the configured accounts, the operating system identifies the account at the other end of
 each connection, a builder token is accepted only on the builder pipe and every other token only on the owner pipe,
 and the TCP port accepts only the read-only dashboard.
 
@@ -171,6 +171,6 @@ swapped in one rename), and starts observe-only until the owner confirms.
 
 ## 10. Not yet
 
-Isolation mode on Linux and macOS (Unix sockets with peer credentials); adapters other than OpenCode over HTTP; pulling
+Adapters other than OpenCode over HTTP; pulling
 work instead of pushing it (needs a fetch that also claims); notifications to the owner outside the feed; dashboard
 actions.

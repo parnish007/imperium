@@ -94,7 +94,7 @@ class Client:
         lines += [f"Content-Length: {len(data or b'')}", "Connection: close", "", ""]
         req = "\r\n".join(lines).encode("latin-1") + (data or b"")
         try:
-            return transport.pipe_request(name, req, timeout_ms=int(timeout * 1000))
+            return transport.request(name, req, timeout_ms=int(timeout * 1000))
         except (ConnectionError, OSError) as e:
             raise DaemonDown(f"the daemon's pipe is not reachable ({e})") from None
 

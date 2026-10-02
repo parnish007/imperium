@@ -1236,13 +1236,10 @@ class Daemon:
         iso = self.cfg["isolation"]
         if not iso["owner_accounts"]:
             return
-        if os.name != "nt":
-            raise RuntimeError("isolation mode is implemented for Windows named pipes only so far")
         for channel, allowed in (("owner", iso["owner_accounts"]), ("builder", iso["builder_accounts"])):
             if not allowed:
                 continue
-            srv = transport.PipeServer(transport.pipe_name(self.home, channel), allowed, _Handler, self.server,
-                                       channel)
+            srv = transport.make_server(self.home, channel, [str(x) for x in allowed], _Handler, self.server)
             srv.start()
             self.pipes[channel] = srv
 

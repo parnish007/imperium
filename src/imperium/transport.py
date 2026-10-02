@@ -2,10 +2,11 @@
 
 On Windows: named pipes whose access list (DACL) admits only the accounts named in the configuration, created with
 FILE_FLAG_FIRST_PIPE_INSTANCE (a process that grabbed the name first makes the daemon refuse to start, instead of
-being talked to) and PIPE_REJECT_REMOTE_CLIENTS. On Linux/macOS: Unix sockets in a directory only the allowed users
-can reach. Every connection is identified by the operating system: the account of the process at the other end
-(Windows: GetNamedPipeClientProcessId -> process token -> user SID; Unix: SO_PEERCRED / getpeereid). The same
-HTTP API runs over the channel, so nothing above the transport changes.
+being talked to) and PIPE_REJECT_REMOTE_CLIENTS. On Linux/macOS: Unix sockets in a private directory that others
+may only traverse (0711), the owner socket 0600; a directory another account could have prepared is refused. Every
+connection is identified by the operating system: the account of the process at the other end (Windows:
+GetNamedPipeClientProcessId -> process token -> user SID; Unix: SO_PEERCRED / getpeereid). The same HTTP API runs
+over the channel, so nothing above the transport changes.
 
 Two channels: `owner` (the owner and the director, who run as the owner's account) and `builder` (builders, under
 their own account). A builder token is accepted only on the builder channel, and every other token only on the
@@ -14,6 +15,7 @@ owner channel; the peer account must be one the channel admits.
 import io
 import os
 import socket
+import stat
 import sys
 import threading
 
@@ -45,6 +47,7 @@ if os.name == "nt":
     k32.CreateFileW.argtypes = [wt.LPCWSTR, wt.DWORD, wt.DWORD, wt.LPVOID, wt.DWORD, wt.DWORD, wt.HANDLE]
     k32.ConnectNamedPipe.argtypes = [wt.HANDLE, wt.LPVOID]
     k32.DisconnectNamedPipe.argtypes = [wt.HANDLE]
+    k32.FlushFileBuffers.argtypes = [wt.HANDLE]
     k32.CloseHandle.argtypes = [wt.HANDLE]
     k32.ReadFile.argtypes = [wt.HANDLE, wt.LPVOID, wt.DWORD, ctypes.POINTER(wt.DWORD), wt.LPVOID]
     k32.WriteFile.argtypes = [wt.HANDLE, wt.LPCVOID, wt.DWORD, ctypes.POINTER(wt.DWORD), wt.LPVOID]
@@ -234,6 +237,7 @@ class PipeServer:
             h = self._instance()
 
     def _serve(self, h):
+        served = False
         try:
             try:
                 sid = peer_sid(h)
@@ -241,10 +245,13 @@ class PipeServer:
                 return
             if sid not in self.allowed:
                 return
+            served = True
             self.handler_class(_PipeSock(h), ("pipe", self.channel, sid), self.server)
         except Exception:  # one bad client must not stop the server
             pass
         finally:
+            if served:  # DisconnectNamedPipe discards what the client has not read yet: wait until it has
+                k32.FlushFileBuffers(h)
             k32.DisconnectNamedPipe(h)
             k32.CloseHandle(h)
 
@@ -289,3 +296,116 @@ def peer_uid(sock):
     if libc.getpeereid(sock.fileno(), c.byref(uid), c.byref(gid)) != 0:
         raise TransportError("getpeereid failed")
     return str(uid.value)
+
+
+def socket_dir(home):
+    """A directory for the sockets outside the runtime folder (builders under another account must reach the
+    builder socket but nothing in the runtime folder). Short, because socket paths are limited to ~100 bytes."""
+    import hashlib
+    import tempfile
+    tag = hashlib.sha256(os.path.abspath(home).encode()).hexdigest()[:12]
+    base = "/tmp" if os.path.isdir("/tmp") else tempfile.gettempdir()
+    return os.path.join(base, f"imperium-{os.getuid()}-{tag}")
+
+
+def _own_dir(path):
+    """Create the socket directory, or reuse it only if it is ours, a real directory, and nobody else can write
+    to it; anything else may have been prepared by another account to intercept the connection."""
+    try:
+        os.mkdir(path, 0o711)
+    except FileExistsError:
+        st = os.lstat(path)
+        if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.getuid() or st.st_mode & 0o022:
+            raise TransportError(f"{path} exists and is not a private directory of this account: refusing to start "
+                                 "rather than share it") from None
+    os.chmod(path, 0o711)  # others may reach a socket by name, not list or create anything
+
+
+class UnixServer:
+    """Serve `handler_class` on a Unix socket admitting only the uids in `allowed` (checked per connection)."""
+
+    def __init__(self, path, allowed, handler_class, server, channel):
+        self.name, self.allowed = path, {str(a) for a in allowed}
+        self.handler_class, self.server, self.channel = handler_class, server, channel
+        _own_dir(os.path.dirname(path))
+        try:
+            os.unlink(path)  # a stale socket from an earlier run, in our own private directory
+        except FileNotFoundError:
+            pass
+        self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.sock.bind(path)
+        os.chmod(path, 0o666 if channel == "builder" else 0o600)
+        self.sock.listen(64)
+        self.stop_event = threading.Event()
+        self.thread = None
+
+    def start(self):
+        self.thread = threading.Thread(target=self._loop, name=f"imperium-sock-{self.channel}", daemon=True)
+        self.thread.start()
+
+    def _loop(self):
+        while not self.stop_event.is_set():
+            try:
+                conn, _ = self.sock.accept()
+            except OSError:
+                return
+            threading.Thread(target=self._serve, args=(conn,), daemon=True).start()
+
+    def _serve(self, conn):
+        try:
+            try:
+                uid = peer_uid(conn)
+            except (OSError, TransportError):
+                return
+            if uid not in self.allowed:
+                return
+            self.handler_class(conn, ("pipe", self.channel, uid), self.server)
+        except Exception:  # one bad client must not stop the server
+            pass
+        finally:
+            conn.close()
+
+    def stop(self):
+        self.stop_event.set()
+        try:
+            self.sock.close()
+            os.unlink(self.name)
+        except OSError:
+            pass
+
+
+def unix_request(path, raw_request, timeout_ms=5000):
+    import http.client
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    sock.settimeout(timeout_ms / 1000)
+    try:
+        sock.connect(path)
+    except OSError as e:
+        sock.close()
+        raise ConnectionError(f"cannot connect to {path} ({e}): is this account allowed?") from None
+    try:
+        sock.sendall(raw_request)
+        resp = http.client.HTTPResponse(sock)
+        resp.begin()
+        return resp.status, resp.read()
+    finally:
+        sock.close()
+
+
+# --- either ---------------------------------------------------------------------------------------------------
+
+def endpoint(home, channel):
+    if os.name == "nt":
+        return pipe_name(home, channel)
+    return os.path.join(socket_dir(home), channel + ".sock")
+
+
+def make_server(home, channel, allowed, handler_class, server):
+    cls = PipeServer if os.name == "nt" else UnixServer
+    return cls(endpoint(home, channel), allowed, handler_class, server, channel)
+
+
+def request(name, raw_request, timeout_ms=5000):
+    if os.name == "nt":
+        return pipe_request(name, raw_request, timeout_ms)
+    return unix_request(name, raw_request, timeout_ms)

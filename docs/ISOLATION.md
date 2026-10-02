@@ -1,4 +1,4 @@
-# Isolation mode (Windows)
+# Isolation mode
 
 Without isolation every actor runs as your Windows account, so a builder that runs shell commands can read
 Imperium's tokens and database and act as you. Isolation mode runs each builder under its **own Windows account**
@@ -21,9 +21,8 @@ What it does not give you:
 - checks run as your account: a visible check runs code from the builder's repository (its tests). Keep the checks
   that matter **held out**: scripts outside the workspace, listed in the check's `depends`, and review the round's
   diff before approving changed check files.
-- Unix sockets for Linux and macOS are not implemented yet.
 
-## Setup
+## Setup on Windows
 
 Run these in an administrator PowerShell where marked.
 
@@ -58,3 +57,27 @@ Run these in an administrator PowerShell where marked.
    then register it as usual (`imperium builder add coding --endpoint http://127.0.0.1:4100 --session ...`).
 7. **Check the boundary** from the builder's account: reading `%USERPROFILE%\.imperium\tokens\owner` of your account
    must fail with "Access is denied", and opening the owner pipe must fail.
+
+## Setup on Linux and macOS
+
+The channels are Unix sockets in `/tmp/imperium-<your uid>-<tag>/`, a directory others may enter but not list or
+write; Imperium refuses to start if it exists with other permissions or another owner. The owner socket is `0600`;
+the builder socket is open to connect, and every connection is checked against the configured uids
+(`SO_PEERCRED` on Linux, `getpeereid` on macOS).
+
+1. `sudo useradd -m imperium-builder` (macOS: create a standard user in System Settings).
+2. `id -u` (yours) and `id -u imperium-builder`.
+3. In `~/.imperium/imperium.toml`, then `imperium down` and `imperium up`:
+   ```
+   [isolation]
+   owner_accounts = ["1000"]
+   builder_accounts = ["1001"]
+   ```
+4. Give `imperium-builder` write access to the builder's repository (a shared group, or ACLs).
+5. `imperium builder mcp-config coding --isolated /home/imperium-builder/imperium-opencode.json`, then
+   `sudo chown imperium-builder: /home/imperium-builder/imperium-opencode.json` and `sudo chmod 600` it.
+6. Start the builder's OpenCode as that account with that config:
+   `sudo -u imperium-builder env OPENCODE_CONFIG=/home/imperium-builder/imperium-opencode.json OPENCODE_SERVER_PASSWORD=... opencode serve --port 4100`,
+   then `imperium builder add coding --endpoint http://127.0.0.1:4100 --session ...`.
+7. From the builder's account, reading your `~/.imperium/tokens/owner` must fail, and connecting to the owner
+   socket must fail.
