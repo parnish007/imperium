@@ -115,6 +115,7 @@ def _parser(err):
     src.add_argument("--file", help="read the message text from this file")
     se.add_argument("--key", help="idempotency key: sending again with the same key and text does nothing new "
                     "(default: a fresh key, printed)")
+    se.add_argument("--needs-resources", action="store_true", help="wait until `imperium gate` says OK")
     qu = add("queue", "messages queued or in flight")
     qu.add_argument("builder", nargs="?")
     qu.add_argument("--all", action="store_true", help="include settled messages")
@@ -132,6 +133,127 @@ def _parser(err):
     mres.add_argument("choice", choices=["wait", "cancel", "resend"])
     mres.add_argument("--confirm-may-run-twice", action="store_true",
                       help="required for resend: the original may still run as well")
+    bt = bsub.add_parser("token", help="issue a new token for the builder's MCP tool (owner)", err=err)
+    bt.add_argument("name")
+    bm = bsub.add_parser("mcp-config", help="print (or --write) the OpenCode config that adds Imperium's builder "
+                         "tool", err=err)
+    bm.add_argument("name")
+    bm.add_argument("--write", action="store_true", help="merge it into opencode.json in the builder's workspace "
+                    "(takes effect when OpenCode restarts; restart it while the builder is idle)")
+    bm.add_argument("--isolated", metavar="FILE",
+                    help="owner, isolation mode: write a standalone OpenCode config for a builder running under its "
+                         "own account (a fresh builder token and the builder pipe, nothing else); start that "
+                         "builder's OpenCode with OPENCODE_CONFIG=FILE")
+    ro = add("round", "give a builder one objective and follow it to a decision")
+    rsub = ro.add_subparsers(dest="round_cmd", parser_class=_Parser)
+    rsub.required = True
+    rop = rsub.add_parser("open", help="open a round: the brief is queued for the builder", err=err)
+    rop.add_argument("builder")
+    g2 = rop.add_mutually_exclusive_group(required=True)
+    g2.add_argument("--objective")
+    g2.add_argument("--objective-file")
+    rop.add_argument("--key", help="idempotency key (default: a fresh one, printed)")
+    rl = rsub.add_parser("list", help="open rounds (--all for decided ones too)", err=err)
+    rl.add_argument("builder", nargs="?")
+    rl.add_argument("--all", action="store_true")
+    rs = rsub.add_parser("show", help="one round with its messages, claims and check runs", err=err)
+    rs.add_argument("id")
+    rm = rsub.add_parser("message", help="send a repair or continue message within the round", err=err)
+    rm.add_argument("id")
+    g3 = rm.add_mutually_exclusive_group(required=True)
+    g3.add_argument("--message")
+    g3.add_argument("--file")
+    rm.add_argument("--key")
+    rv = rsub.add_parser("verify", help="snapshot the code and run the round's trusted checks", err=err)
+    rv.add_argument("id")
+    rv.add_argument("--wait", type=float, default=0, metavar="SECONDS", help="wait for the result")
+    rob = rsub.add_parser("objective", help="record whether the result meets the objective", err=err)
+    rob.add_argument("id")
+    rob.add_argument("verdict", choices=["met", "not-met"])
+    rob.add_argument("--note", default="")
+    rd = rsub.add_parser("diff", help="what changed since the round began", err=err)
+    rd.add_argument("id")
+    for verb in ("accept", "reject", "abandon"):
+        x = rsub.add_parser(verb, help=f"{verb} the round (a principal's decision; the first one wins)", err=err)
+        x.add_argument("id")
+        x.add_argument("--note", default="")
+        if verb == "accept":
+            x.add_argument("--override", action="store_true", help="owner: accept although not VERIFIED or the "
+                           "workspace changed (journaled as an override)")
+    ck = add("check", "trusted checks: commands Imperium runs to verify a round")
+    csub = ck.add_subparsers(dest="check_cmd", parser_class=_Parser)
+    csub.required = True
+    ca = csub.add_parser("add", help="define a check: imperium check add ID --builder B -- pytest -q tests", err=err)
+    ca.add_argument("id")
+    g4 = ca.add_mutually_exclusive_group(required=True)
+    g4.add_argument("--builder")
+    g4.add_argument("--round")
+    ca.add_argument("--dir", default=".", help="working directory, relative to the builder's directory")
+    ca.add_argument("--env", action="append", default=[], help="environment variable passed through (repeatable)")
+    ca.add_argument("--timeout", type=float, default=1800)
+    ca.add_argument("--must-fail-on-base", action="store_true",
+                    help="it must fail on the code before the round, or it does not test the change")
+    ca.add_argument("--depends", action="append", default=[],
+                    help="a file the check relies on (test, script); a change to it makes the check untrusted")
+    ca.add_argument("--optional", action="store_true", help="report it, but do not require it to pass")
+    ca.add_argument("argv", nargs="+", help="the command, after --")
+    cl = csub.add_parser("list", help="checks", err=err)
+    cl.add_argument("--builder")
+    cl.add_argument("--round")
+    cp = csub.add_parser("approve", help="owner: accept the current versions of a check's files", err=err)
+    cp.add_argument("id")
+    cr = csub.add_parser("retire", help="owner: stop using a check", err=err)
+    cr.add_argument("id")
+    bmcp = add("builder-mcp", "run the builder's MCP tool on stdio (started by OpenCode, not by hand)")
+    bmcp.add_argument("--builder", required=True)
+    ap = add("approvals", "permission asks waiting for a decision (--auto: the automatic answers report)")
+    ap.add_argument("--all", action="store_true", help="include decided ones")
+    ap.add_argument("--auto", action="store_true", help="owner: answers given by your rules; marks them reported")
+    ap.add_argument("--builder")
+    av = add("approve", "allow a permission ask")
+    av.add_argument("id")
+    av.add_argument("--always", action="store_true", help="owner: allow this pattern for the rest of the session")
+    av.add_argument("--note", default="")
+    dn = add("deny", "refuse a permission ask")
+    dn.add_argument("id")
+    dn.add_argument("--note", default="")
+    ru = add("rule", "the owner's approval rules (used only while the director is present)")
+    rusub = ru.add_subparsers(dest="rule_cmd", parser_class=_Parser)
+    rusub.required = True
+    rua = rusub.add_parser("add", help="owner: add a rule", err=err)
+    rua.add_argument("permission", help="bash, edit, read, webfetch, ... or *")
+    rua.add_argument("pattern", help="glob over the ask's patterns, e.g. 'git status*'")
+    g5 = rua.add_mutually_exclusive_group(required=True)
+    g5.add_argument("--allow", action="store_true")
+    g5.add_argument("--deny", action="store_true")
+    rua.add_argument("--path-under", help="only paths inside this absolute directory")
+    rua.add_argument("--builder")
+    rusub.add_parser("list", help="rules", err=err)
+    rur = rusub.add_parser("remove", help="owner: remove a rule", err=err)
+    rur.add_argument("id", type=int)
+    qs = add("questions", "questions builders asked")
+    qs.add_argument("--all", action="store_true")
+    an = add("answer", "answer a builder's question")
+    an.add_argument("id")
+    g6 = an.add_mutually_exclusive_group(required=True)
+    g6.add_argument("--choice", action="append", help="chosen label(s), one --choice per question; "
+                    "several labels for one question separated by '|'")
+    g6.add_argument("--reject", action="store_true")
+    w = add("watch", "print new feed headlines as they arrive; never moves the bookmark (for a monitor)")
+    w.add_argument("--consumer")
+    w.add_argument("--duration", type=float, default=1800, help="seconds before it exits (default 30 min)")
+    w.add_argument("--interval", type=float, default=2.0)
+    add("mcp", "run the director's MCP server on stdio (started by Claude Code)")
+    hk = add("hook", "Claude Code hook entry points (started by the plugin)")
+    hk.add_argument("kind", choices=["session-start", "post-tool-use"])
+    pl = add("plugin", "the Claude Code plugin for this installation")
+    pl.add_argument("action", choices=["write"])
+    pl.add_argument("dir", help="where to write the plugin")
+    db = add("dashboard", "open the read-only dashboard (a short-lived token, in this browser tab only)")
+    db.add_argument("--no-open", action="store_true")
+    add("gate", "are there free resources for heavy work? OK or WAIT with the reason")
+    ex = add("export", "write the journal as JSON lines (owner; builder text included, already redacted)")
+    ex.add_argument("--out", required=True)
     sa = add("stop-all", "send nothing to any builder until the owner resumes")
     sa.add_argument("--reason")
     add("resume-all", "end stop-all (owner)")
@@ -163,7 +285,7 @@ def main(argv=None, out=None, err=None, env=None):
     except SystemExit as e:  # --help / --version
         return int(e.code or 0)
     home = paths.home(args.home, env)
-    ctx = {"home": home, "env": env, "as_owner": args.as_who == "owner", "args": args}
+    ctx = {"home": home, "env": env, "as_owner": args.as_who == "owner", "args": args, "out": out}
     try:
         result = COMMANDS[args.cmd](ctx)
         code = result.pop("_code", OK)
@@ -181,6 +303,8 @@ def main(argv=None, out=None, err=None, env=None):
     except Exception as e:  # no tracebacks
         result, code = {"ok": False, "error": f"{type(e).__name__}: {e}"}, ERROR
     result.setdefault("ok", code == OK)
+    if result.pop("_quiet", False):
+        return code
     if args.json:
         out.write(json.dumps(result, ensure_ascii=False, indent=None) + "\n")
     else:
@@ -410,6 +534,37 @@ def cmd_builder(ctx):
     c = _owner_or_refuse(ctx)
     if a.builder_cmd == "remove":
         return c.call("POST", "/v1/builders/remove", {"name": a.name})
+    if a.builder_cmd == "token":
+        return c.call("POST", "/v1/builders/token", {"name": a.name})
+    if a.builder_cmd == "mcp-config" and a.isolated:
+        r = c.call("POST", "/v1/builders/token", {"name": a.name, "reveal": True})
+        if not r.get("pipe"):
+            raise Fail(REFUSED, "isolation mode is off, or no builder accounts are configured ([isolation] in "
+                                "imperium.toml)")
+        cfg = {"$schema": "https://opencode.ai/config.json",
+               "mcp": {"imperium": {"type": "local", "enabled": True,
+                                    "command": [sys.executable, "-m", "imperium", "builder-mcp", "--builder", a.name],
+                                    "environment": {"IMPERIUM_BUILDER_TOKEN": r["token"], "IMPERIUM_PIPE": r["pipe"]}}}}
+        from . import fsutil
+        fsutil.atomic_write(os.path.abspath(a.isolated), json.dumps(cfg, indent=2), mode=0o600)
+        return {"written": os.path.abspath(a.isolated), "pipe": r["pipe"],
+                "note": "give this file to the builder's account only; it holds that builder's token"}
+    if a.builder_cmd == "mcp-config":
+        b = c.call("GET", "/v1/builders?name=" + urllib.parse.quote(a.name))["builder"]
+        cfg = mcp_config(ctx["home"], a.name)
+        if not a.write:
+            return {"config": cfg, "file": os.path.join(b["directory"], "opencode.json"),
+                    "note": "merge this into opencode.json, then restart OpenCode while the builder is idle"}
+        path = os.path.join(b["directory"], "opencode.json")
+        current = {}
+        if os.path.exists(path):
+            with open(path, encoding="utf-8") as f:
+                current = json.load(f)
+        current.setdefault("mcp", {})["imperium"] = cfg["mcp"]["imperium"]
+        current.setdefault("$schema", cfg["$schema"])
+        from . import fsutil
+        fsutil.atomic_write(path, json.dumps(current, indent=2) + "\n")
+        return {"written": path, "note": "restart OpenCode while the builder is idle to load the tool"}
     if a.builder_cmd in ("pause", "resume"):
         return c.call("POST", f"/v1/builders/{a.builder_cmd}", {"name": a.name})
     if a.builder_cmd == "allow-version":
@@ -431,7 +586,8 @@ def cmd_send(ctx):
     else:
         text = a.message
     key = a.key or "cli-" + secrets.token_hex(8)
-    r = _client(ctx).call("POST", "/v1/send", {"builder": a.builder, "body": text, "client_key": key})
+    r = _client(ctx).call("POST", "/v1/send", {"builder": a.builder, "body": text, "client_key": key,
+                                               "needs_resources": a.needs_resources})
     r["client_key"] = key
     return r
 
@@ -455,6 +611,261 @@ def cmd_msg(ctx):
         return c.call("POST", "/v1/cancel", {"id": a.id})
     return c.call("POST", "/v1/message/resolve", {"id": a.id, "choice": a.choice,
                                                   "confirm_may_run_twice": a.confirm_may_run_twice})
+
+
+def _text_arg(text, path):
+    if path:
+        with open(path, encoding="utf-8") as f:
+            return f.read()
+    return text
+
+
+def cmd_round(ctx):
+    a = ctx["args"]
+    c = _client(ctx)
+    q = urllib.parse.quote
+    if a.round_cmd == "open":
+        key = a.key or "cli-" + secrets.token_hex(8)
+        r = c.call("POST", "/v1/rounds", {"builder": a.builder, "objective": _text_arg(a.objective, a.objective_file),
+                                          "client_key": key})
+        r["client_key"] = key
+        return r
+    if a.round_cmd == "list":
+        query = {}
+        if a.builder:
+            query["builder"] = a.builder
+        if a.all:
+            query["all"] = "1"
+        return c.call("GET", "/v1/rounds" + ("?" + urllib.parse.urlencode(query) if query else ""))
+    if a.round_cmd == "show":
+        return c.call("GET", "/v1/round?id=" + q(a.id))
+    if a.round_cmd == "diff":
+        return c.call("GET", "/v1/rounds/diff?id=" + q(a.id), timeout=120)
+    if a.round_cmd == "message":
+        key = a.key or "cli-" + secrets.token_hex(8)
+        return c.call("POST", "/v1/rounds/message", {"id": a.id, "body": _text_arg(a.message, a.file),
+                                                     "client_key": key})
+    if a.round_cmd == "objective":
+        return c.call("POST", "/v1/rounds/objective", {"id": a.id, "met": a.verdict == "met", "note": a.note})
+    if a.round_cmd == "verify":
+        r = c.call("POST", "/v1/rounds/verify", {"id": a.id})
+        end = time.monotonic() + a.wait
+        while a.wait and time.monotonic() < end:
+            cur = c.call("GET", "/v1/round?id=" + q(a.id))
+            if not cur["round"]["verify_job"]:
+                return cur
+            time.sleep(1)
+        return r
+    body = {"id": a.id, "decision": a.round_cmd, "note": a.note}
+    if getattr(a, "override", False):
+        body["override"] = True
+    return c.call("POST", "/v1/rounds/decide", body, timeout=120)
+
+
+def cmd_check(ctx):
+    a = ctx["args"]
+    if a.check_cmd == "list":
+        query = {k: v for k, v in (("builder", a.builder), ("round", a.round)) if v}
+        return _client(ctx).call("GET", "/v1/checks" + ("?" + urllib.parse.urlencode(query) if query else ""))
+    if a.check_cmd == "approve":
+        return _owner_or_refuse(ctx).call("POST", "/v1/checks/approve", {"id": a.id}, timeout=60)
+    if a.check_cmd == "retire":
+        return _owner_or_refuse(ctx).call("POST", "/v1/checks/retire", {"id": a.id})
+    body = {"id": a.id, "argv": a.argv, "working_dir": a.dir, "env": a.env, "timeout": a.timeout,
+            "must_fail_on_base": a.must_fail_on_base, "depends": a.depends, "required": not a.optional}
+    body["builder" if a.builder else "round"] = a.builder or a.round
+    return _client(ctx).call("POST", "/v1/checks", body, timeout=60)
+
+
+def cmd_builder_mcp(ctx):
+    from . import mcp
+    c = Client(ctx["home"], principal="builder:" + ctx["args"].builder, env=ctx["env"])
+    mcp.builder_server(c).serve()
+    return {"_code": OK, "_quiet": True}
+
+
+def mcp_config(home, name):
+    exe = sys.executable
+    return {"$schema": "https://opencode.ai/config.json",
+            "mcp": {"imperium": {"type": "local", "enabled": True,
+                                 "command": [exe, "-m", "imperium", "--home", home, "builder-mcp", "--builder", name]}}}
+
+
+def cmd_approvals(ctx):
+    a = ctx["args"]
+    q = {}
+    if a.builder:
+        q["builder"] = a.builder
+    if a.all:
+        q["all"] = "1"
+    if a.auto:
+        c = _owner_or_refuse(ctx)
+        q["auto"] = "1"
+        r = c.call("GET", "/v1/approvals?" + urllib.parse.urlencode(q))
+        c.call("POST", "/v1/approvals/report-seen", {})
+        return r
+    return _client(ctx).call("GET", "/v1/approvals" + ("?" + urllib.parse.urlencode(q) if q else ""))
+
+
+def cmd_approve(ctx):
+    a = ctx["args"]
+    return _client(ctx).call("POST", "/v1/approvals/decide", {"id": a.id, "reply": "always" if a.always else "once",
+                                                              "note": a.note})
+
+
+def cmd_deny(ctx):
+    a = ctx["args"]
+    return _client(ctx).call("POST", "/v1/approvals/decide", {"id": a.id, "reply": "reject", "note": a.note})
+
+
+def cmd_rule(ctx):
+    a = ctx["args"]
+    if a.rule_cmd == "list":
+        return _client(ctx).call("GET", "/v1/approvals/rules")
+    c = _owner_or_refuse(ctx)
+    if a.rule_cmd == "remove":
+        return c.call("POST", "/v1/approvals/rules/remove", {"id": a.id})
+    body = {"permission": a.permission, "pattern": a.pattern, "decision": "allow" if a.allow else "deny"}
+    if a.path_under:
+        body["path_under"] = os.path.abspath(a.path_under)
+    if a.builder:
+        body["builder"] = a.builder
+    return c.call("POST", "/v1/approvals/rules", body)
+
+
+def cmd_questions(ctx):
+    return _client(ctx).call("GET", "/v1/questions" + ("?all=1" if ctx["args"].all else ""))
+
+
+def cmd_answer(ctx):
+    a = ctx["args"]
+    if a.reject:
+        return _client(ctx).call("POST", "/v1/questions/answer", {"id": a.id, "reject": True})
+    answers = [[x for x in c.split("|") if x] for c in a.choice]
+    return _client(ctx).call("POST", "/v1/questions/answer", {"id": a.id, "answers": answers})
+
+
+def cmd_watch(ctx):
+    a = ctx["args"]
+    c = _client(ctx)
+    consumer = a.consumer or _default_consumer(ctx, c)
+    out = ctx["out"]
+    end = time.monotonic() + a.duration
+    after, warned = None, set()
+    while time.monotonic() < end:
+        body = {"consumer": consumer, "limit": 100}
+        if after is not None:
+            body["after"] = after
+        try:
+            r = c.call("POST", "/v1/events_since", body)
+        except DaemonDown as e:
+            out.write(f"IMPERIUM_DOWN {e}\n")
+            out.flush()
+            time.sleep(min(30.0, a.interval * 5))
+            continue
+        for e in r["events"]:
+            out.write(e["headline"] + "\n")
+            after = e["seq"]
+        for item in (r.get("urgent") or {}).get("items", []):
+            if item["seq"] not in warned:
+                warned.add(item["seq"])
+                out.write("URGENT " + item["headline"] + "\n")
+        if after is None:
+            after = r.get("high_water") if not r["events"] else after
+        out.flush()
+        if not r.get("more"):
+            time.sleep(a.interval)
+    out.write(f"WATCH_EXPIRING resume_after={after}\n")
+    out.flush()
+    return {"_quiet": True}
+
+
+def cmd_mcp(ctx):
+    from . import director_mcp
+    director_mcp.server(Client(ctx["home"], env=ctx["env"])).serve()
+    return {"_quiet": True}
+
+
+def cmd_hook(ctx):
+    """Never fails and never blocks Claude Code: every error is swallowed."""
+    out = ctx["out"]
+    sid = ctx["env"].get("CLAUDE_CODE_SESSION_ID")
+    try:
+        if ctx["args"].kind == "post-tool-use":
+            if not sid:
+                return {"_quiet": True}
+            mark = os.path.join(ctx["home"], "run", f"presence-{sid}")
+            try:
+                if time.time() - os.path.getmtime(mark) < 60:
+                    return {"_quiet": True}
+            except OSError:
+                pass
+            os.makedirs(os.path.dirname(mark), exist_ok=True)
+            with open(mark, "w", encoding="ascii") as f:
+                f.write("1")
+            Client(ctx["home"], env=ctx["env"]).call("POST", "/v1/director/presence", {}, timeout=3)
+            return {"_quiet": True}
+        c = Client(ctx["home"], env=ctx["env"])
+        if c.health() is None:
+            try:
+                cmd_up(ctx)
+            except Exception:
+                pass
+        try:
+            st = c.call("GET", "/v1/status", timeout=5)
+        except tokens.NoCredential:
+            out.write("Imperium is available. This session is not its director; to make it one, the owner runs "
+                      "`imperium --as owner director claim` in this session.\n")
+            return {"_quiet": True}
+        lines = [f"Imperium: {st.get('needs_you', 0)} unacknowledged ACTION/CRITICAL event(s) in your feed"]
+        if st.get("approvals_open"):
+            lines.append(f"{st['approvals_open']} permission ask(s) waiting")
+        if st.get("questions_open"):
+            lines.append(f"{st['questions_open']} question(s) waiting")
+        if st.get("quarantine"):
+            lines.append("QUARANTINED: tell the owner")
+        if st.get("stop_all"):
+            lines.append(f"stop-all is on: {st['stop_all']}")
+        out.write("; ".join(lines) + ". Read the feed with events_since before acting (skill: imperium).\n")
+    except Exception:
+        pass
+    return {"_quiet": True}
+
+
+def cmd_plugin(ctx):
+    from . import plugingen
+    return plugingen.write(ctx["args"].dir, ctx["home"])
+
+
+def cmd_dashboard(ctx):
+    r = _client(ctx).call("POST", "/v1/dashboard/token", {})
+    if not ctx["args"].no_open:
+        import webbrowser
+        webbrowser.open(r["url"])
+    return {"url": r["url"], "note": "read-only; the link works in one tab until the daemon restarts or 12 h idle"}
+
+
+def cmd_gate(ctx):
+    r = _client(ctx).call("GET", "/v1/gate")
+    if r.get("gate") != "OK":
+        r["_code"] = REFUSED
+    return r
+
+
+def cmd_export(ctx):
+    c = _owner_or_refuse(ctx)
+    after, n = 0, 0
+    tmp = ctx["args"].out + ".partial"
+    with open(tmp, "w", encoding="utf-8") as f:
+        while True:
+            r = c.call("GET", f"/v1/journal?after={after}&limit=1000&full=1", timeout=60)
+            for e in r["events"]:
+                f.write(json.dumps(e, ensure_ascii=False) + "\n")
+                after, n = e["seq"], n + 1
+            if len(r["events"]) < 1000:
+                break
+    os.replace(tmp, ctx["args"].out)
+    return {"written": ctx["args"].out, "events": n}
 
 
 def cmd_stop_all(ctx):
@@ -567,6 +978,10 @@ COMMANDS = {
     "backup": cmd_backup, "restore": cmd_restore, "restore-confirm": cmd_restore_confirm, "token": cmd_token,
     "builder": cmd_builder, "director": cmd_director, "quarantine": cmd_quarantine,
     "send": cmd_send, "queue": cmd_queue, "msg": cmd_msg, "stop-all": cmd_stop_all, "resume-all": cmd_resume_all,
+    "round": cmd_round, "check": cmd_check, "builder-mcp": cmd_builder_mcp, "approvals": cmd_approvals,
+    "approve": cmd_approve, "deny": cmd_deny, "rule": cmd_rule, "questions": cmd_questions, "answer": cmd_answer,
+    "watch": cmd_watch, "mcp": cmd_mcp, "hook": cmd_hook, "plugin": cmd_plugin, "dashboard": cmd_dashboard,
+    "gate": cmd_gate, "export": cmd_export,
 }
 
 

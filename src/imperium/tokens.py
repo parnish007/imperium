@@ -7,6 +7,7 @@ import secrets
 from . import fsutil, journal
 
 _SESSION = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
+_BUILDER = re.compile(r"^[a-z0-9][a-z0-9_-]{0,31}$")
 
 
 class NoCredential(RuntimeError):
@@ -89,6 +90,11 @@ def _locator_name(principal):
         if not _SESSION.match(sid):
             raise ValueError("a Claude Code session id may contain only letters, digits, '-' and '_'")
         return "director-" + sid
+    if principal.startswith("builder:"):
+        name = principal.split(":", 1)[1]
+        if not _BUILDER.match(name):
+            raise ValueError("not a builder name")
+        return "builder-" + name
     raise ValueError(f"no locator for principal {principal!r}")
 
 

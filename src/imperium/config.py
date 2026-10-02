@@ -25,6 +25,22 @@ SCHEMA = {
         "admit_timeout": (float, 300.0),  # seconds a delivered message may wait unrun on an idle builder
         "stall_alert": (float, 600.0),  # seconds messages may wait on a blocked builder before an ACTION event
     },
+    "approvals": {
+        "lease_ttl": (float, 900.0),  # seconds a director's presence lasts after its last call (automatic answers)
+    },
+    "liveness": {
+        "stall_after": (float, 600.0),  # seconds a WORKING builder may be silent before SUSPECTED_STALL
+        "max_suppress": (float, 1800.0),  # seconds busy sub-agents may hide a silent parent before HANG_SUSPECTED
+    },
+    "resources": {
+        "min_free_gb": (float, 3.0),  # free memory below this makes `imperium gate` say WAIT
+    },
+    "isolation": {
+        # Isolation mode (Windows): accounts (SIDs) admitted to the owner pipe (owner and director) and to the
+        # builder pipe. Empty: off. When on, the TCP port accepts only the read-only dashboard.
+        "owner_accounts": (list, []),
+        "builder_accounts": (list, []),
+    },
     "integrity": {
         "verify_interval": (float, 300.0),  # seconds between journal chain checks while running
     },
@@ -66,6 +82,21 @@ reconcile_window = 60.0
 admit_timeout = 300.0
 # Seconds messages may wait on a blocked builder before Imperium raises an ACTION event saying why.
 stall_alert = 600.0
+
+[approvals]
+# Seconds the director counts as present after its last call. Automatic answers by the owner's rules happen only
+# while it is present; otherwise a matching ask is HELD for a decision by hand.
+lease_ttl = 900.0
+
+[liveness]
+# Seconds a working builder may be silent before SUSPECTED_STALL (report only; nothing is killed).
+stall_after = 600.0
+# Seconds busy sub-agents may hide a silent builder before HANG_SUSPECTED.
+max_suppress = 1800.0
+
+[resources]
+# Free memory (GB) below which `imperium gate` says WAIT and messages sent with --needs-resources wait.
+min_free_gb = 3.0
 
 [integrity]
 # Seconds between journal chain checks while running (a break quarantines Imperium).

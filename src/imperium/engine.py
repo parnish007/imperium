@@ -9,13 +9,14 @@ Delivery runs only right after a successful poll of the same builder, so eligibi
 stale state. A message is POSTed at most once: the DISPATCHING row is committed before the request, and
 anything short of a definite answer is reconciled by looking for the message's own id, never by posting again.
 """
+import hashlib
 import json
 import logging
 import os
 import threading
 import time
 
-from . import builders, journal, opencode, outbox
+from . import approvals, builders, journal, liveness, opencode, outbox, rounds, snapshot
 from .reader import Reader
 from .store import StoreFailed, meta_get
 
@@ -84,8 +85,9 @@ class Engine:
 
     def state(self, name):
         h = self.health.get(name) or {}
+        op = "UNREACHABLE" if h.get("reachable") is False else h.get("op_state")
         return {"reachable": h.get("reachable"), "failures": h.get("failures", 0), "last_error": h.get("last_error"),
-                "dispatch_blocked": h.get("blocked")}
+                "dispatch_blocked": h.get("blocked"), "operational_state": op}
 
     def _poll(self, b, secrets, respect_backoff):
         name = b["name"]
@@ -159,7 +161,14 @@ class Engine:
         cp = json.loads(r[0]) if r else {}
         idle = cp.get("status") == "idle" and not cp.get("open") and not cp.get("busy_children")
         h["idle_polls"] = h.get("idle_polls", 0) + 1 if idle else 0
+        h["op_state"] = liveness.operational_state(cp, h, b, stop_all)
+        lc = self.d.cfg["liveness"]
+        alarm = liveness.check_stall(h, h["op_state"], cp, time.monotonic(), lc["stall_after"], lc["max_suppress"])
+        if alarm:
+            self._event(b, alarm[0], "ACTION", alarm[1])
         self._reconcile(b, cp, client)
+        self._claim_files(b)
+        self._replies(b, client)
         reason = self._blocked(b, cp, h, stop_all, observe)
         h["blocked"] = reason
         if reason is None:
@@ -214,8 +223,13 @@ class Engine:
             return "waiting for the builder to stay idle"
         with self.d.store.read() as conn:
             holder = outbox.holder(conn, b["name"])
+            nxt = outbox.next_queued(conn, b["name"], owner_only=bool(b["paused"]))
         if holder:
             return f"message {holder} in flight"
+        if nxt and nxt["needs_resources"]:
+            verdict, why, _ = liveness.gate(self.d.cfg["resources"]["min_free_gb"])
+            if verdict != "OK":
+                return f"waiting for resources: {why}"
         return None
 
     def _reconcile(self, b, cp, client):
@@ -261,8 +275,83 @@ class Engine:
                                                 "note": "saved in the builder but not run while it is idle; "
                                                         "nothing else is sent to it until a decision"})
 
+    def _replies(self, b, client):
+        """Deliver decided approvals and answered questions to OpenCode; retried every cycle until delivered."""
+        with self.d.store.read() as conn:
+            due = approvals.replies_due(conn, b["name"])
+            qdue = approvals.question_replies_due(conn, b["name"])
+        for a in due:
+            try:
+                client.reply_permission(a["id"], a["reply"])
+                ok = True
+            except opencode.OCError as e:
+                ok = e.status == 404  # already gone: nothing left to answer
+            except opencode.OCUnreachable:
+                continue
+            with self.d.store.tx() as conn:
+                if ok:
+                    approvals.reply_sent(conn, a["id"], True)
+        for q in qdue:
+            try:
+                if q["state"] == approvals.REJECTED:
+                    client.reject_question(q["id"])
+                else:
+                    client.reply_question(q["id"], q["answers"])
+                ok = True
+            except opencode.OCError as e:
+                ok = e.status == 404
+            except opencode.OCUnreachable:
+                continue
+            if ok:
+                with self.d.store.tx() as conn:
+                    approvals.question_reply_sent(conn, q["id"])
+
+    def _claim_files(self, b):
+        """The fallback claim channel: `.imperium/claims/<round>.json` in the builder's workspace."""
+        with self.d.store.read() as conn:
+            live = conn.execute("SELECT id, claim_file_hash FROM rounds WHERE builder=? AND state IN "
+                                f"({','.join('?' * len(rounds.LIVE))})", (b["name"], *rounds.LIVE)).fetchall()
+        for rid, seen in live:
+            path = rounds.claim_path(b["directory"], rid)
+            try:
+                with open(path, "rb") as f:
+                    raw = f.read(256_000)
+            except OSError:
+                continue
+            digest = hashlib.sha256(raw).hexdigest()
+            if digest == seen:
+                continue
+            with self.d.store.tx() as conn:
+                conn.execute("UPDATE rounds SET claim_file_hash=? WHERE id=?", (digest, rid))
+                rounds.apply_claim_file(conn, builder=b["name"], rid=rid, raw=raw.decode("utf-8", "replace"),
+                                        now=self.clock())
+
+    def _base_snapshot(self, b):
+        """Just before a round's opening message is sent: the code as the builder starts from it."""
+        with self.d.store.read() as conn:
+            m = outbox.next_queued(conn, b["name"], owner_only=bool(b["paused"]))
+            if m is None or m["kind"] != "open" or not m["round"]:
+                return
+            r = rounds.get(conn, m["round"])
+        if r["base_commit"]:
+            return
+        try:
+            snap = snapshot.take(b["directory"], f"refs/imperium/{b['name']}/{r['id']}/base")
+            snapshot.ensure_excluded(snap["top"])
+        except (snapshot.SnapshotError, OSError) as e:
+            self._event(b, "SNAPSHOT_FAILED", "NOTICE", {"round": r["id"], "kind": "base", "error": str(e)[:300],
+                                                         "effect": "this round cannot be verified"})
+            return
+        with self.d.store.tx() as conn:
+            conn.execute("UPDATE rounds SET base_commit=?, base_tree=? WHERE id=?", (snap["commit"], snap["tree"],
+                                                                                    r["id"]))
+            journal.append(conn, "SNAPSHOT_TAKEN", "INFO", builder=b["name"],
+                           data={"round": r["id"], "generation": 1, "kind": "base", "tree": snap["tree"],
+                                 "commit": snap["commit"], "ref": snap["ref"], "files": snap["files"]})
+
     def _dispatch(self, b, client):
         name, now = b["name"], self.clock()
+        self._base_snapshot(b)
         with self.d.store.tx() as conn:
             if outbox.holder(conn, name):
                 return
@@ -270,10 +359,12 @@ class Engine:
             if m is None:
                 return
             oc_id = opencode.message_id()
+            extra, gen = rounds.header_fields(conn, m)
+            body = rounds.body_for(conn, m, gen)
             outbox.reserve(conn, name, m["id"], now)
             outbox.transition(conn, m["id"], outbox.DISPATCHING, event="MSG_DISPATCHING",
-                              data={"oc_message_id": oc_id}, oc_message_id=oc_id, dispatched_at=now)
-        text = f"[imperium msg={m['id']} builder={name}]\n{m['body']}"
+                              data={"oc_message_id": oc_id}, oc_message_id=oc_id, dispatched_at=now, round_gen=gen)
+        text = f"[imperium msg={m['id']} builder={name}{extra}]\n{body}"
         try:
             client.prompt_async(b["session_id"], oc_id, [{"type": "text", "text": text}])
             to, event, sev, data = outbox.POSTED, "MSG_POSTED", "INFO", {}
@@ -301,6 +392,16 @@ class Engine:
                                          self.clock())
                 elif o["type"] == "TURN_STARTED" and o["data"].get("parent_id"):
                     outbox.observed_turn(conn, b["name"], o["data"]["parent_id"], self.clock())
+                elif o["type"] == "PERMISSION_ASKED" and o.get("raw"):
+                    if approvals.observe_ask(conn, b["name"], o["raw"], self.clock()):
+                        lease_ok, director = self.d.lease_ok()
+                        approvals.apply_policy(conn, o["raw"]["id"], b["directory"], lease_ok, director, self.clock())
+                elif o["type"] == "PERMISSION_GONE":
+                    approvals.gone(conn, o["data"]["permission_id"])
+                elif o["type"] == "QUESTION_ASKED" and o.get("raw"):
+                    approvals.observe_question(conn, b["name"], o["raw"], self.clock())
+                elif o["type"] == "QUESTION_GONE":
+                    approvals.question_gone(conn, o["data"]["question_id"])
             conn.execute("INSERT INTO checkpoints(builder, data, updated) VALUES(?,?,?) "
                          "ON CONFLICT(builder) DO UPDATE SET data=excluded.data, updated=excluded.updated",
                          (b["name"], json.dumps(cp), journal.now()))

@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "imperium-ai"
 version = "0.1.0.dev0"
-description = "Exactly-once prompt delivery, an acknowledged event journal and verified rounds between an AI director and AI coding builders."
+description = "An accountability layer between an AI director, AI coding builders and their human owner: durable message delivery with proof, an acknowledged event journal, and rounds verified by trusted checks on code snapshots."
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.11"
@@ -19,3 +19,6 @@ imperium = "imperium.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+imperium = ["plugin_data/**/*", "dashboard/*"]

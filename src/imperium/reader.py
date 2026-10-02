@@ -181,12 +181,14 @@ class Reader:
         before = set(cp.get("perm_last") or [])
         for p in mine:
             if p["id"] not in before:
-                out.append(self._obs("PERMISSION_ASKED", "ACTION",
-                                     {"permission_id": p["id"], "permission": p.get("permission"),
-                                      "tool": p.get("tool")},
-                                     text={"patterns": p.get("patterns"), "always": p.get("always"),
-                                           "metadata": p.get("metadata")},
-                                     key=f"perm:{p['id']}:asked"))
+                o = self._obs("PERMISSION_ASKED", "ACTION",
+                              {"permission_id": p["id"], "permission": p.get("permission"), "tool": p.get("tool")},
+                              text={"patterns": p.get("patterns"), "always": p.get("always"),
+                                    "metadata": p.get("metadata")},
+                              key=f"perm:{p['id']}:asked")
+                o["raw"] = {"id": p["id"], "permission": p.get("permission"), "patterns": p.get("patterns") or [],
+                            "always": p.get("always") or []}
+                out.append(o)
         for pid in sorted(before - set(now)):
             out.append(self._obs("PERMISSION_GONE", "INFO", {"permission_id": pid}, key=f"perm:{pid}:gone"))
         cp["permissions"] = now
@@ -198,9 +200,11 @@ class Reader:
         before = set(cp.get("questions") or [])
         for q in mine:
             if q["id"] not in before:
-                out.append(self._obs("QUESTION_ASKED", "ACTION",
-                                     {"question_id": q["id"], "count": len(q.get("questions") or [])},
-                                     text={"questions": q.get("questions")}, key=f"question:{q['id']}:asked"))
+                o = self._obs("QUESTION_ASKED", "ACTION",
+                              {"question_id": q["id"], "count": len(q.get("questions") or [])},
+                              text={"questions": q.get("questions")}, key=f"question:{q['id']}:asked")
+                o["raw"] = {"id": q["id"], "questions": q.get("questions") or []}
+                out.append(o)
         for qid in sorted(before - set(now)):
             out.append(self._obs("QUESTION_GONE", "INFO", {"question_id": qid}, key=f"question:{qid}:gone"))
         cp["questions"] = now
@@ -227,6 +231,9 @@ class Reader:
                 if m["info"].get("time", {}).get("completed"):
                     self._end(m, cp, out)
                     del cp["open"][mid]
+                else:  # how far the reply has got: liveness counts growth as progress
+                    st["size"] = sum(len(str(p.get("text") or p.get("state") or "")) for p in m.get("parts") or [])
+                    st["parts"] = len(m.get("parts") or [])
             elif m.get("parts"):
                 self._classify_user(m, cp, out)
                 del cp["open"][mid]

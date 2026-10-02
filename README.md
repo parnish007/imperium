@@ -4,7 +4,7 @@
 
 A director is an AI session that plans and reviews work (for example a Claude Code session). A builder is a coding agent that does the work (OpenCode first). A human *owner* stays in charge of both.
 
-> **Status: pre-alpha.** Stages 1-3 of 9 are built: the store, the event journal, the reading feeds, the background service, the command line, *watching* OpenCode builders (everything a builder does becomes an event), and *delivering* messages to them through a durable outbox. Rounds and claim verification, approvals, the MCP server and the dashboard are designed but **not built yet**. Do not rely on it for real work.
+> **Status: pre-alpha.** All nine planned stages are built and tested against a fake OpenCode server reproducing OpenCode 1.18.32's behaviour and known bugs; see [Testing](#testing) for what has and has not been run against a real server. Expect rough edges.
 
 ## Why
 
@@ -51,7 +51,7 @@ Imperium's job is to make each of these visible and recoverable.
 ## Security model: read this
 
 - **Imperium is not a sandbox.** A builder running as your OS user can do anything you can, including reading Imperium's files and acting as the director. A builder hijacked by a malicious web page (prompt injection) is a realistic way for that to happen. If you need containment, run builders as another OS user, in a container or in a VM.
-- **"Owner-only" is enforced against software that follows the protocol, not against a hostile process.** The owner's token is a file in your runtime folder; any program running as your OS user, including a builder, can read it and act as the owner. A real boundary needs the builder under another OS user, in a container or a VM. A mode where the service runs under its own identity and is reached through an OS-permissioned pipe or socket is planned.
+- **"Owner-only" is enforced against software that follows the protocol, not against a hostile process.** The owner's token is a file in your runtime folder; any program running as your OS user, including a builder, can read it and act as the owner. A real boundary needs the builder under another OS user, in a container or a VM. **Isolation mode** (Windows) runs builders under their own account and admits them only through a named pipe that the operating system guards: see [docs/ISOLATION.md](docs/ISOLATION.md). Linux and macOS support is not done yet.
 - The local API listens on `127.0.0.1` only, checks the `Host` and `Origin` headers (these stop web pages, not local programs), and needs a 256-bit bearer token. Tokens are stored hashed; the runtime folder is readable only by your user.
 - The journal's hash chain detects accidental corruption and naive edits. A process running as the same user could recompute it, so it is an integrity check, not proof.
 
@@ -65,45 +65,64 @@ cd imperium
 uv tool install .        # or: pip install .
 ```
 
-## Use what exists today
+## Quick start
 
 ```
-imperium init            # create ~/.imperium (or $IMPERIUM_HOME): database, config, owner token
-imperium up              # start the background service (idempotent)
-imperium status          # service, journal and feed status; "needs you" count
-imperium events          # read your feed up to its high-water mark
-imperium ack <seq>       # mark it read, only as far as you were shown
-imperium show <seq>      # look at one event without moving anything
-imperium verify-journal  # check the integrity chain (works with the service stopped)
-imperium backup          # online backup; `imperium restore <file>` with the service stopped
-imperium doctor          # check the installation (`--contract` prints a setup report)
-imperium down            # stop the service
+imperium init                      # ~/.imperium (or $IMPERIUM_HOME): database, config, owner token
+imperium up                        # start the background service (idempotent)
 
-imperium builder add coding --endpoint http://127.0.0.1:<port> --session <ses_id> \n    --directory <workspace> --password-env OPENCODE_SERVER_PASSWORD   # watch an OpenCode session
-imperium builder list   # registered builders; `imperium status` shows reachability and why nothing is sent
+# register an OpenCode session as a builder (its server: `opencode serve`)
+imperium builder add coding --endpoint http://127.0.0.1:<port> --session <ses_id> --directory <repo>
+imperium builder mcp-config coding --write    # adds Imperium's builder tool; restart OpenCode while idle
 
-imperium send coding --message "..." --key fix-42   # queue a message; the same key and text never send twice
-imperium queue coding    # what is waiting or in flight
-imperium msg show <id>   # one message and its state
-imperium msg resolve <id> wait|cancel|resend [--confirm-may-run-twice]   # decide on an UNCERTAIN/STRANDED one
-imperium stop-all        # send nothing to anyone (`imperium resume-all`, owner, to undo)
-imperium builder pause coding                 # owner: only the owner's messages go to this builder
-imperium builder allow-version coding 1.19.0  # owner: accept an OpenCode version Imperium was not tested on
+# a trusted check: Imperium runs it on a snapshot, never in the live workspace
+imperium check add unit --builder coding --depends tests/test_calc.py --must-fail-on-base -- python -m pytest -q
 
-# inside the Claude Code session that will direct (the owner authorises it):
-imperium --as owner director claim
-imperium status         # now acts as the director, with its own feed
-
-imperium quarantine release --reason "..."   # owner, after inspecting a broken journal
+# one round of work
+imperium round open coding --objective "Make add() add; tests/test_calc.py must pass."
+imperium round list                # PENDING -> OPEN -> CLAIMED_READY ...
+imperium round verify <round> --wait 600
+imperium round objective <round> met --note "..."
+imperium round accept <round>      # refused unless VERIFIED and the workspace is unchanged
 ```
 
-Once a builder is registered, the service polls it and journals what happens: turns starting and ending, tool errors, permission asks, questions, retries, compactions, and any message that Imperium did not send (shown to you as CRITICAL). Builder text is treated as untrusted: secrets are redacted before anything is stored. The server password is never stored, only the name of the variable (or file) that holds it.
+Then, for the director (a Claude Code session):
 
-A queued message is sent only when the builder is idle and stays idle, no permission or question is pending, no reply or sub-agent is still running, and its OpenCode version is one Imperium was tested on. One message is in flight per builder. Imperium names the message (in OpenCode's own id format) before sending it and proves delivery by finding exactly that id in the builder's history, never by matching text. Anything short of proof (a timeout, a dropped connection, an error after the server may have saved it) is looked up by id; if it is not found within a minute the message becomes **UNCERTAIN** and waits for your decision. Imperium never resends on its own: a resend may run twice, so it needs explicit confirmation, and if both copies run you are told (CRITICAL). A message saved but never run (a known OpenCode failure) becomes **STRANDED** and blocks the builder until decided. A queue that stays blocked for ten minutes raises an ACTION event saying why.
+```
+imperium plugin write ~/imperium-plugin       # skill, MCP server, hooks; validated with `claude plugin validate`
+claude --plugin-dir ~/imperium-plugin
+imperium --as owner director claim            # run once inside that session
+```
 
-Inside a Claude Code session the CLI acts as the *director* and never falls back to the owner's credential; the owner adds `--as owner` there. Every command takes `--json`. Exit codes: `0` ok, `1` error, `2` usage, `3` service not running, `4` refused, `5` integrity or doctor failure.
+More:
 
-Configuration lives in `~/.imperium/imperium.toml`. Unknown keys are rejected.
+```
+imperium status / events / ack <seq> / show <seq>     # what happened; your feed and its bookmark
+imperium send coding --message "..." --key k1          # a message outside rounds
+imperium queue / msg show <id> / msg resolve <id> wait|cancel|resend --confirm-may-run-twice
+imperium approvals / approve <id> / deny <id>          # permission asks; `approvals --auto`: what your rules answered
+imperium rule add bash "git status*" --allow           # owner: rules used only while the director is present
+imperium questions / answer <id> --choice "A"
+imperium round diff <round> / round message <round> --message "..." / round reject <round>
+imperium check list / check approve <id> (owner) / check retire <id> (owner)
+imperium gate                      # enough free memory for heavy work? (`send --needs-resources` waits for it)
+imperium dashboard                 # read-only view in your browser
+imperium watch --consumer director # new headlines as they arrive (for a monitor); never acknowledges
+imperium stop-all / resume-all     # the emergency brake (anyone) and its release (owner)
+imperium backup / restore <file> / verify-journal / export --out f.jsonl / doctor / down
+```
+
+Every command takes `--json`. Exit codes: `0` ok, `1` error, `2` usage, `3` service not running, `4` refused, `5` integrity or doctor failure. Inside a Claude Code session the CLI acts as the director and never falls back to the owner's credential; the owner adds `--as owner` there. Configuration: `~/.imperium/imperium.toml` (unknown keys are rejected).
+
+## How a round is verified
+
+1. When the round opens, its brief (objective, nonce, how to report, when to escalate) is queued and the code is snapshotted just before the brief is sent.
+2. The builder reports `ready` through its tool (or a claim file), quoting the round's nonce and current generation. A claim is evidence, not acceptance.
+3. `round verify` snapshots the code again and, for each trusted check: refuses to trust it if a file it depends on changed (only the owner can approve new versions); runs it in a fresh copy of the snapshot with a minimal environment and a timeout; runs it on the starting snapshot too when it must fail there (a check that passes without the change does not test the change); records the executable and its hash, the environment names, the exit code and the output.
+4. A person or the director records whether the objective is met. Only then is the round VERIFIED.
+5. Accept is refused if the workspace changed since the verified snapshot. A repair message starts a new generation and voids VERIFIED.
+
+The details, and what each guarantee does *not* cover, are in [docs/SPEC.md](docs/SPEC.md).
 
 ## Roadmap
 
@@ -112,16 +131,16 @@ Configuration lives in `~/.imperium/imperium.toml`. Unknown keys are rejected.
 | 1 | Store, journal and integrity chain, retention, backup and restore, feeds, call audit, service, CLI | **done** |
 | 2 | Watching OpenCode builders: turns, messages, permissions, questions, status, catch-up after downtime | **done** |
 | 3 | Queue, dispatcher and the delivery state machine, recovery | **done** |
-| 4 | Rounds, claims, escalation, builder MCP | next |
-| 5 | Approvals, director identity, questions, path rules | planned |
-| 6 | Director MCP server, `watch`, tokens and the full local API | planned |
-| 7 | Liveness (sub-agent aware) and resource gates | planned |
-| 8 | Claude Code plugin and the director's playbook | planned |
-| 9 | Read-only dashboard | planned |
+| 4 | Rounds, claims, escalation, trusted checks on snapshots, builder MCP | **done** |
+| 5 | Approvals with presence lease and the automatic-answer report, questions, path rules | **done** |
+| 6 | Director MCP server, `watch`, the full local API | **done** |
+| 7 | Liveness (sub-agent aware) and the resource gate | **done** |
+| 8 | Claude Code plugin and the director's playbook | **done** |
+| 9 | Read-only dashboard | **done** |
 
-Later: an Agent Client Protocol (ACP) adapter, dashboard controls, a reviewer module, a secrets manager.
+Next: isolation mode on Linux and macOS, more builder adapters (Claude Code, Codex, ACP), owner notifications, dashboard actions.
 
-## Development
+## Testing
 
 The core uses only the Python standard library (Python 3.11 or newer). The tests are part of the product: crash and fault cases, tampering, restore, idempotency, history catch-up and a fake OpenCode server with its known quirks. Run them with:
 

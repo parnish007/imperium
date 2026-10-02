@@ -40,7 +40,7 @@ WATCHED_AFTER_END = (CANCELLED, SUPERSEDED)
 SOURCE_ORDER = {"owner": 0, "director": 1, "system": 2}
 FIELDS = ("id", "builder", "client_key", "source", "principal", "kind", "body", "state", "oc_message_id",
           "supersedes", "created", "dispatched_at", "delivered_at", "admitted_at", "late_admitted_at",
-          "decided_by", "note")
+          "decided_by", "note", "round", "round_gen", "needs_resources")
 
 
 class OutboxError(ValueError):
@@ -83,7 +83,8 @@ def list_(conn, builder=None, states=None, limit=200):
     return [_row(r) for r in conn.execute(q, args)]
 
 
-def enqueue(conn, *, builder, body, client_key, principal, kind="prompt", supersedes=None, now=None):
+def enqueue(conn, *, builder, body, client_key, principal, kind="prompt", supersedes=None, round_=None, now=None,
+            needs_resources=False):
     """Queue an instruction. The same key with the same body returns the existing row; with another body, refused."""
     if not client_key:
         raise OutboxError("client_key is required (it makes retries of a send safe)")
@@ -96,12 +97,14 @@ def enqueue(conn, *, builder, body, client_key, principal, kind="prompt", supers
         return _row(old)
     mid = new_id()
     conn.execute("INSERT INTO outbox(id, builder, client_key, source, principal, kind, body, body_hash, state, "
-                 "supersedes, created) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
-                 (mid, builder, client_key, source, principal, kind, body, digest, QUEUED, supersedes,
-                  now if now is not None else time.time()))
-    journal.append(conn, "MSG_QUEUED", "INFO", builder=builder, caller=principal,
-                   data={"message": mid, "source": source, "kind": kind, "supersedes": supersedes,
-                         "bytes": len(body.encode("utf-8"))})
+                 "supersedes, round, needs_resources, created) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                 (mid, builder, client_key, source, principal, kind, body, digest, QUEUED, supersedes, round_,
+                  1 if needs_resources else 0, now if now is not None else time.time()))
+    data = {"message": mid, "source": source, "kind": kind, "supersedes": supersedes,
+            "bytes": len(body.encode("utf-8"))}
+    if round_:
+        data["round"] = round_
+    journal.append(conn, "MSG_QUEUED", "INFO", builder=builder, caller=principal, data=data)
     return get(conn, mid)
 
 
@@ -115,6 +118,12 @@ def transition(conn, mid, to, *, event, severity="INFO", data=None, caller=None,
                    data={"message": mid, "from": m["state"], "to": to, **(data or {})})
     if to in (ADMITTED, REJECTED, CANCELLED, SUPERSEDED):
         release(conn, m["builder"], mid)
+    if m["round"]:
+        from . import rounds  # rounds imports this module
+        if to == ADMITTED:
+            rounds.on_admitted(conn, get(conn, mid), fields.get("admitted_at") or time.time())
+        elif to in (REJECTED, CANCELLED):
+            rounds.on_message_ended(conn, m, to, time.time())
     return get(conn, mid)
 
 
@@ -250,6 +259,6 @@ def resolve(conn, mid, choice, principal, confirm_may_run_twice=False, now=None)
             raise OutboxError("resending may make the builder run it twice; confirm with confirm_may_run_twice")
         transition(conn, mid, SUPERSEDED, event="MSG_SUPERSEDED", caller=principal, decided_by=principal)
         new = enqueue(conn, builder=m["builder"], body=m["body"], client_key=f"resend-of-{mid}",
-                      principal=principal, kind=m["kind"], supersedes=mid, now=now)
+                      principal=principal, kind=m["kind"], supersedes=mid, round_=m["round"], now=now)
         return {"message": get(conn, mid), "resent_as": new["id"]}
     raise OutboxError("choice must be wait, cancel or resend")

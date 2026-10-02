@@ -128,6 +128,138 @@ SCHEMA = [
         since REAL NOT NULL
     );
     """,
+    # version 5: rounds, claims, trusted checks and their runs (stage 4)
+    """
+    ALTER TABLE outbox ADD COLUMN round TEXT;
+    ALTER TABLE outbox ADD COLUMN round_gen INTEGER;
+    CREATE INDEX outbox_round ON outbox(round);
+    CREATE TABLE rounds(
+        id TEXT PRIMARY KEY,
+        builder TEXT NOT NULL,
+        objective TEXT NOT NULL,
+        nonce TEXT NOT NULL,
+        generation INTEGER NOT NULL,
+        state TEXT NOT NULL,
+        escalation TEXT,
+        opened_by TEXT NOT NULL,
+        client_key TEXT NOT NULL,
+        opening_msg TEXT,
+        base_commit TEXT,
+        base_tree TEXT,
+        cand_commit TEXT,
+        cand_tree TEXT,
+        cand_generation INTEGER,
+        claim_state TEXT,
+        claim_generation INTEGER,
+        objective_met INTEGER,
+        objective_generation INTEGER,
+        objective_note TEXT,
+        checks_ok_generation INTEGER,
+        untrusted INTEGER NOT NULL DEFAULT 0,
+        verify_job TEXT,
+        decided_by TEXT,
+        decision_note TEXT,
+        override INTEGER NOT NULL DEFAULT 0,
+        claim_file_hash TEXT,
+        created REAL NOT NULL,
+        updated REAL NOT NULL,
+        UNIQUE(builder, client_key)
+    );
+    CREATE INDEX rounds_state ON rounds(builder, state);
+    CREATE TABLE claims(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        round TEXT NOT NULL,
+        generation INTEGER NOT NULL,
+        channel TEXT NOT NULL,
+        state TEXT NOT NULL,
+        digest TEXT NOT NULL,
+        created REAL NOT NULL
+    );
+    CREATE INDEX claims_round ON claims(round, generation);
+    CREATE TABLE checks(
+        id TEXT NOT NULL,
+        version INTEGER NOT NULL,
+        scope TEXT NOT NULL,
+        argv TEXT NOT NULL,
+        working_dir TEXT NOT NULL,
+        env TEXT NOT NULL,
+        timeout REAL NOT NULL,
+        must_fail_on_base INTEGER NOT NULL,
+        depends TEXT NOT NULL,
+        required INTEGER NOT NULL,
+        active INTEGER NOT NULL,
+        created_by TEXT NOT NULL,
+        created TEXT NOT NULL,
+        PRIMARY KEY(id, version)
+    );
+    CREATE TABLE check_runs(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        round TEXT NOT NULL,
+        generation INTEGER NOT NULL,
+        check_id TEXT NOT NULL,
+        check_version INTEGER NOT NULL,
+        target TEXT NOT NULL,
+        commit_id TEXT NOT NULL,
+        tree TEXT NOT NULL,
+        exit_code INTEGER,
+        timed_out INTEGER NOT NULL,
+        duration REAL NOT NULL,
+        output_sha256 TEXT,
+        output_path TEXT,
+        executable TEXT,
+        executable_sha256 TEXT,
+        env_names TEXT NOT NULL,
+        created REAL NOT NULL
+    );
+    CREATE INDEX check_runs_round ON check_runs(round);
+    """,
+    # version 6: approvals, the owner's approval rules, questions (stage 5)
+    """
+    CREATE TABLE approval_rules(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        permission TEXT NOT NULL,
+        pattern TEXT NOT NULL,
+        path_under TEXT,
+        decision TEXT NOT NULL,
+        builder TEXT,
+        created_by TEXT NOT NULL,
+        created TEXT NOT NULL,
+        active INTEGER NOT NULL
+    );
+    CREATE TABLE approvals(
+        id TEXT PRIMARY KEY,
+        builder TEXT NOT NULL,
+        permission TEXT,
+        patterns TEXT,
+        always TEXT,
+        state TEXT NOT NULL,
+        decided_by TEXT,
+        by_policy INTEGER NOT NULL DEFAULT 0,
+        rule INTEGER,
+        reply TEXT,
+        reply_state TEXT NOT NULL,
+        note TEXT,
+        created REAL NOT NULL,
+        decided_at REAL,
+        decided_seq INTEGER
+    );
+    CREATE INDEX approvals_state ON approvals(builder, state);
+    CREATE TABLE questions(
+        id TEXT PRIMARY KEY,
+        builder TEXT NOT NULL,
+        shape TEXT NOT NULL,
+        state TEXT NOT NULL,
+        answers TEXT,
+        decided_by TEXT,
+        reply_state TEXT NOT NULL,
+        created REAL NOT NULL,
+        decided_at REAL
+    );
+    """,
+    # version 7: messages that wait for free resources (stage 7)
+    """
+    ALTER TABLE outbox ADD COLUMN needs_resources INTEGER NOT NULL DEFAULT 0;
+    """,
 ]
 
 

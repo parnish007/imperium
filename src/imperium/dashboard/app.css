@@ -1,0 +1,20 @@
+:root { --paper: #f6f1e7; --ink: #1d1b18; --muted: #6b645a; --line: #d8cfbf; --warn: #9a5b00; --bad: #a3221b; --ok: #2f6b2f; }
+@media (prefers-color-scheme: dark) { :root { --paper: #191816; --ink: #ece6da; --muted: #a39b8d; --line: #3a3630; --warn: #e0a040; --bad: #f06a5f; --ok: #7fbf7f; } }
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--paper); color: var(--ink); font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; }
+header { display: flex; gap: 12px; align-items: center; padding: 12px 20px; border-bottom: 1px solid var(--line); flex-wrap: wrap; }
+h1 { font-size: 18px; margin: 0; letter-spacing: .04em; }
+h2 { font-size: 14px; text-transform: uppercase; letter-spacing: .08em; color: var(--muted); margin: 24px 0 8px; }
+main { padding: 0 20px 20px; max-width: 1200px; }
+table { width: 100%; border-collapse: collapse; }
+th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--line); vertical-align: top; }
+th { font-weight: 600; color: var(--muted); }
+.list { list-style: none; margin: 0; padding: 0; }
+.list li { padding: 6px 0; border-bottom: 1px solid var(--line); }
+.mono, code { font-family: ui-monospace, "Cascadia Mono", Consolas, monospace; font-size: 12.5px; }
+.muted { color: var(--muted); }
+.pill { border: 1px solid var(--line); border-radius: 999px; padding: 2px 10px; font-size: 12px; }
+.bad { color: var(--bad); } .warn { color: var(--warn); } .ok { color: var(--ok); }
+footer { padding: 16px 20px; border-top: 1px solid var(--line); }
+td.objective { max-width: 420px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+@media (max-width: 700px) { main, header, footer { padding-left: 16px; padding-right: 16px; } table { font-size: 12px; } }

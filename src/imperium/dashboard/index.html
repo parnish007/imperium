@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>Imperium</title>
+<link rel="stylesheet" href="/dashboard/app.css">
+<script src="/dashboard/app.js" defer></script>
+</head>
+<body>
+<header>
+  <h1>Imperium</h1>
+  <span id="conn" class="pill">connecting</span>
+  <span id="chain" class="pill"></span>
+  <span id="updated" class="muted"></span>
+</header>
+<main>
+  <section id="needs">
+    <h2>Needs you</h2>
+    <ul id="needs-list" class="list"></ul>
+  </section>
+  <section>
+    <h2>Builders</h2>
+    <table id="fleet"><thead><tr><th>Builder</th><th>State</th><th>Queue</th><th>In flight</th><th>Why nothing is sent</th><th>OpenCode</th></tr></thead><tbody></tbody></table>
+  </section>
+  <section>
+    <h2>Rounds</h2>
+    <table id="rounds"><thead><tr><th>Round</th><th>Builder</th><th>State</th><th>Gen</th><th>Escalation</th><th>Objective</th></tr></thead><tbody></tbody></table>
+  </section>
+  <section>
+    <h2>Delivery ledger</h2>
+    <table id="ledger"><thead><tr><th>Message</th><th>Builder</th><th>From</th><th>Kind</th><th>State</th><th>Queued</th><th>Round</th></tr></thead><tbody></tbody></table>
+  </section>
+  <section>
+    <h2>Recent events</h2>
+    <ul id="events" class="list mono"></ul>
+  </section>
+</main>
+<footer class="muted">Read-only. Builder text is never shown here; use <code>imperium show &lt;seq&gt;</code>. The token lives only in this tab: reload means running <code>imperium dashboard</code> again.</footer>
+</body>
+</html>
