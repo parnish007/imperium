@@ -16,7 +16,8 @@ import urllib.parse
 
 from . import __version__, audit, backup, builders, config, feeds, journal, opencode, paths, retention, tokens
 from .engine import Engine
-from .store import Store, StoreFailed, meta_get
+from . import fsutil
+from .store import Store, StoreFailed, meta_get, meta_set
 
 log = logging.getLogger("imperiumd")
 
@@ -122,8 +123,8 @@ def r_status(d, principal, body, query):
                        **(d.engine.state(b["name"]) if d.engine else {})})
     return {"run_id": d.run_id, "pid": d.pid, "port": d.port, "started": d.started, "version": __version__,
             "principal": principal, "head_seq": head_seq, "chain": d.chain, "archives": d.archives,
-            "observe_only": observe_only, "consumers": consumers, "needs_you": needs_you,
-            "audit_dropped": dropped, "builders": bl}
+            "observe_only": observe_only, "quarantine": d.quarantine(), "consumers": consumers,
+            "needs_you": needs_you, "audit_dropped": dropped, "builders": bl}
 
 
 def r_builders(d, principal, body, query):
@@ -174,6 +175,87 @@ def r_builder_remove(d, principal, body, query):
     return {"removed": body["name"]}
 
 
+def _active_director(conn):
+    return conn.execute("SELECT * FROM directors WHERE released_at IS NULL ORDER BY id DESC LIMIT 1").fetchone()
+
+
+def r_director_show(d, principal, body, query):
+    with d.store.read() as conn:
+        r = _active_director(conn)
+    return {"director": None if r is None else {"session_id": r["session_id"], "claimed_at": r["claimed_at"],
+                                                "claimed_by": r["claimed_by"]}}
+
+
+def r_director_claim(d, principal, body, query):
+    """The owner registers a Claude Code session as the director (DESIGN §8.4) [C9]."""
+    sid = str(_req(body, "session_id"))
+    who = "director:" + sid
+    tokens.check_principal(who)
+    with d.store.tx() as conn:
+        active = _active_director(conn)
+        if active is not None and active["session_id"] != sid:
+            raise builders.Conflict(f"session {active['session_id']} is the registered director; it (or the owner) "
+                                    "must run `imperium director release` first")
+        tokens.revoke_principal(conn, who)
+        if active is None:
+            conn.execute("INSERT INTO directors(session_id, claimed_at, claimed_by) VALUES(?,?,?)",
+                         (sid, journal.now(), principal))
+        raw = tokens.issue(conn, who)
+        if conn.execute("SELECT 1 FROM consumers WHERE name='director'").fetchone():
+            feeds.reassign(conn, "director", who)  # the feed belongs to the role: unread events carry over
+        else:
+            feeds.create(conn, "director", principal=who, floor="ACTION")
+        journal.append(conn, "DIRECTOR_CLAIMED", "NOTICE", caller=principal, data={"session_id": sid})
+    try:
+        tokens.write_locator(d.home, who, raw)
+    except BaseException:
+        with d.store.tx() as conn:
+            tokens.revoke_principal(conn, who)
+            conn.execute("UPDATE directors SET released_at=? WHERE session_id=? AND released_at IS NULL",
+                         (journal.now(), sid))
+            journal.append(conn, "DIRECTOR_CLAIM_FAILED", "NOTICE", caller=principal, data={"session_id": sid})
+        raise
+    return {"director": {"session_id": sid}, "locator": f"tokens/director-{sid}"}
+
+
+def r_director_release(d, principal, body, query):
+    with d.store.tx() as conn:
+        active = _active_director(conn)
+        if active is None:
+            raise feeds.Refused("no director is registered")
+        who = "director:" + active["session_id"]
+        if principal not in ("owner", who):
+            raise feeds.NotYours("only the registered director or the owner can release it")
+        tokens.revoke_principal(conn, who)
+        conn.execute("UPDATE directors SET released_at=? WHERE id=?", (journal.now(), active["id"]))
+        journal.append(conn, "DIRECTOR_RELEASED", "NOTICE", caller=principal,
+                       data={"session_id": active["session_id"]})
+    tokens.remove_locator(d.home, who)
+    return {"released": active["session_id"]}
+
+
+def r_quarantine_release(d, principal, body, query):
+    """The owner accepts a broken journal after inspecting it: the head is anchored, verification restarts
+    from it, and the break stays listed in every verification [C6]."""
+    reason = str(_req(body, "reason")).strip()
+    if not reason:
+        raise HttpError(400, "a reason is required")
+    with d.store.tx() as conn:
+        if not meta_get(conn, "quarantine"):
+            raise feeds.Refused("Imperium is not quarantined")
+        v = journal.verify_chain(conn)
+        head_seq, head_hash = journal.head(conn)
+        conn.execute("INSERT INTO anchors(seq, hash, first_bad, reason, ts) VALUES(?,?,?,?,?)",
+                     (head_seq, head_hash, v.first_bad, reason, journal.now()))
+        conn.execute("UPDATE consumers SET shown_through=MIN(shown_through, ?), acked_seq=MIN(acked_seq, ?)",
+                     (head_seq, head_seq))
+        meta_set(conn, "quarantine", None)
+        journal.append(conn, "QUARANTINE_RELEASED", "NOTICE", caller=principal,
+                       data={"anchored_at_seq": head_seq, "first_bad": v.first_bad, "reason": reason})
+    d.refresh_chain()
+    return {"anchored_at_seq": head_seq}
+
+
 def r_consumers(d, principal, body, query):
     name, floor = _req(body, "name"), _req(body, "floor")
     with d.store.tx() as conn:
@@ -203,9 +285,9 @@ def r_show(d, principal, body, query):
 
 
 def r_verify(d, principal, body, query):
-    with d.store.read() as conn:
-        r = journal.verify_chain(conn)
-    return {"chain_ok": r.ok, "checked": r.checked, "first_bad": r.first_bad, "reason": r.reason}
+    c = d.refresh_chain()
+    return {"chain_ok": c["ok"], "checked": c["checked"], "first_bad": c["first_bad"], "reason": c["reason"],
+            "checked_through_seq": c["checked_through_seq"], "accepted_breaks": c["accepted_breaks"]}
 
 
 def r_prune(d, principal, body, query):
@@ -214,7 +296,9 @@ def r_prune(d, principal, body, query):
 
 def r_backup(d, principal, body, query):
     dest = body.get("dest")
-    if not dest:
+    if dest:
+        dest = backup.check_destination(d.home, str(dest))
+    else:
         os.makedirs(paths.backups(d.home), exist_ok=True)
         stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
         dest = os.path.join(paths.backups(d.home), f"imperium-{stamp}.db")
@@ -229,11 +313,7 @@ def r_restore_confirm(d, principal, body, query):
 
 
 def r_token_rotate(d, principal, body, query):
-    with d.store.tx() as conn:
-        tokens.revoke_principal(conn, "owner")
-        raw = tokens.issue(conn, "owner")
-        tokens.write_locator(d.home, "owner", raw)  # inside the transaction: a failed write rolls back
-        journal.append(conn, "TOKEN_ROTATED", "NOTICE", caller=principal, data={"principal": "owner"})
+    tokens.rotate_owner(d.store, d.home)
     return {"rotated": "owner", "locator": "tokens/owner"}
 
 
@@ -246,6 +326,10 @@ def r_shutdown(d, principal, body, query):
 
 ROUTES = {
     ("GET", "/v1/health"): (r_health, None, False),
+    ("GET", "/v1/director"): (r_director_show, "any", False),
+    ("POST", "/v1/director/claim"): (r_director_claim, "owner", True),
+    ("POST", "/v1/director/release"): (r_director_release, "any", True),
+    ("POST", "/v1/quarantine/release"): (r_quarantine_release, "owner", True),
     ("GET", "/v1/status"): (r_status, "any", False),
     ("POST", "/v1/consumers"): (r_consumers, "any", True),
     ("GET", "/v1/builders"): (r_builders, "any", False),
@@ -261,6 +345,12 @@ ROUTES = {
     ("POST", "/v1/token/rotate"): (r_token_rotate, "owner", True),
     ("POST", "/v1/shutdown"): (r_shutdown, "owner", True),
 }
+
+
+# State changes still allowed while quarantined: reading feeds (which records what was shown), backups,
+# stopping, and the owner's release. Everything that dispatches, decides or changes trust waits [C6].
+QUARANTINE_OK = {"/v1/events_since", "/v1/ack", "/v1/consumers", "/v1/backup", "/v1/quarantine/release",
+                 "/v1/shutdown"}
 
 
 def _req(body, key):
@@ -359,13 +449,17 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         body = self._body(d)
         if writes and d.store.failed:
             raise HttpError(503, d.store.failed)
+        if writes and url.path not in QUARANTINE_OK:
+            q = d.quarantine()
+            if q:
+                raise HttpError(503, f"quarantined: {q}; inspect, then `imperium quarantine release` (owner)")
         try:
             out = fn(d, principal, body, urllib.parse.parse_qs(url.query))
         except feeds.NotYours as e:
             raise HttpError(403, str(e)) from None
         except builders.Conflict as e:
             raise HttpError(409, str(e)) from None
-        except (feeds.Refused, retention.PruneRefused, sqlite3.IntegrityError) as e:
+        except (feeds.Refused, retention.PruneRefused) as e:
             raise HttpError(409, str(e)) from None
         except StoreFailed as e:
             raise HttpError(503, str(e)) from None
@@ -437,19 +531,35 @@ class Daemon:
         log.info("imperiumd %s listening on 127.0.0.1:%s (run %s)", __version__, self.port, self.run_id)
         return self
 
-    def _recover(self):
+    def quarantine(self):
+        with self.store.read() as conn:
+            return meta_get(conn, "quarantine")
+
+    def refresh_chain(self):
+        """Verify the chain now and record when, and through which event, it was checked [C16]."""
         with self.store.read() as conn:
             r = journal.verify_chain(conn)
-        self.chain = {"ok": r.ok, "checked": r.checked, "first_bad": r.first_bad, "reason": r.reason}
+            head_seq, _ = journal.head(conn)
+            breaks = journal.accepted_breaks(conn)
+        self.chain = {"ok": r.ok, "checked": r.checked, "first_bad": r.first_bad, "reason": r.reason,
+                      "checked_at": journal.now(), "checked_through_seq": head_seq, "accepted_breaks": breaks}
+        return self.chain
+
+    def _recover(self):
+        r = self.refresh_chain()
         self.archives = retention.check_archives(self.store, paths.archive(self.home))
         with self.store.tx() as conn:
-            if not r.ok:
+            tokens.finish_rotation(conn, self.home)
+            if not r["ok"]:
+                # An untrustworthy journal stops everything that acts; reading stays possible [C6].
                 journal.append(conn, "INTEGRITY_FAIL", "CRITICAL",
-                               data={"first_bad": r.first_bad, "reason": r.reason})
+                               data={"first_bad": r["first_bad"], "reason": r["reason"]})
+                meta_set(conn, "quarantine", f"journal chain broken at event {r['first_bad']}: {r['reason']}")
+                journal.append(conn, "QUARANTINED", "CRITICAL", data={"reason": "journal chain broken"})
             journal.append(conn, "DAEMON_STARTED", "INFO",
                            data={"run_id": self.run_id, "pid": self.pid, "version": __version__})
             journal.append(conn, "RECOVERED", "INFO",
-                           data={"chain_ok": r.ok, "archives_removed": len(self.archives["removed"]),
+                           data={"chain_ok": r["ok"], "archives_removed": len(self.archives["removed"]),
                                  "archives_missing": len(self.archives["missing"]),
                                  "archives_mismatched": len(self.archives["mismatched"]),
                                  "observe_only": meta_get(conn, "observe_only")})
@@ -457,10 +567,7 @@ class Daemon:
     def _write_info(self):
         info = {"port": self.port, "pid": self.pid, "run_id": self.run_id, "started": self.started,
                 "version": __version__}
-        tmp = paths.daemon_json(self.home) + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(info, f)
-        os.replace(tmp, paths.daemon_json(self.home))
+        fsutil.atomic_write(paths.daemon_json(self.home), json.dumps(info), mode=0o600)
 
     def serve_forever(self):
         self.server.serve_forever(poll_interval=0.2)

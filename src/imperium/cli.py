@@ -80,6 +80,8 @@ def _parser(err):
     b.add_argument("--to")
     r = add("restore", "restore a backup; the daemon must be stopped (owner)")
     r.add_argument("path")
+    r.add_argument("--force", action="store_true",
+                   help="restore a backup that fails Imperium's checks, into quarantine")
     add("restore-confirm", "end observe-only mode after a restore (owner)")
     bl = add("builder", "register and inspect builders")
     bsub = bl.add_subparsers(dest="builder_cmd", parser_class=_Parser)
@@ -98,6 +100,17 @@ def _parser(err):
     bs.add_argument("name")
     br = bsub.add_parser("remove", help="unregister a builder (owner)", err=err)
     br.add_argument("name")
+    dr = add("director", "register the Claude Code session that directs builders")
+    dsub = dr.add_subparsers(dest="director_cmd", parser_class=_Parser)
+    dsub.required = True
+    dsub.add_parser("claim", help="register this Claude Code session as the director (owner: --as owner)", err=err)
+    dsub.add_parser("release", help="unregister the director (the director itself or the owner)", err=err)
+    dsub.add_parser("show", help="show the registered director", err=err)
+    qa = add("quarantine", "inspect or end quarantine after a journal integrity failure")
+    qsub = qa.add_subparsers(dest="quarantine_cmd", parser_class=_Parser)
+    qsub.required = True
+    qr = qsub.add_parser("release", help="accept the broken journal after inspection (owner)", err=err)
+    qr.add_argument("--reason", required=True, help="why the owner accepts it; recorded in the journal")
     t = add("token", "manage tokens (owner)")
     t.add_argument("action", choices=["rotate"])
     return p
@@ -320,7 +333,12 @@ def cmd_backup(ctx):
         store = Store(paths.db(ctx["home"]))
         try:
             dest = body.get("dest")
-            if not dest:
+            if dest:
+                try:
+                    dest = backup.check_destination(ctx["home"], dest)
+                except ValueError as e:
+                    raise Fail(ERROR, str(e)) from None
+            else:
                 os.makedirs(paths.backups(ctx["home"]), exist_ok=True)
                 dest = os.path.join(paths.backups(ctx["home"]),
                                     f"imperium-{datetime.datetime.now():%Y%m%d-%H%M%S}.db")
@@ -335,7 +353,7 @@ def cmd_restore(ctx):
     _owner_or_refuse(ctx)
     lock = _with_lock(ctx, "restore")
     try:
-        backup.restore(os.path.abspath(ctx["args"].path), paths.db(ctx["home"]))
+        backup.restore(os.path.abspath(ctx["args"].path), paths.db(ctx["home"]), force=ctx["args"].force)
     except backup.RestoreError as e:
         raise Fail(ERROR, str(e)) from None
     finally:
@@ -364,6 +382,23 @@ def cmd_builder(ctx):
     if a.password_file:
         body["password_file"] = os.path.abspath(a.password_file)
     return c.call("POST", "/v1/builders", body)
+
+
+def cmd_director(ctx):
+    a = ctx["args"]
+    if a.director_cmd == "show":
+        return _client(ctx).call("GET", "/v1/director")
+    if a.director_cmd == "release":
+        return _client(ctx).call("POST", "/v1/director/release", {})
+    sid = ctx["env"].get("CLAUDE_CODE_SESSION_ID")
+    if not sid:
+        raise Fail(ERROR, "run this inside the Claude Code session that will direct: CLAUDE_CODE_SESSION_ID is not "
+                   "set here")
+    return _owner_or_refuse(ctx).call("POST", "/v1/director/claim", {"session_id": sid})
+
+
+def cmd_quarantine(ctx):
+    return _owner_or_refuse(ctx).call("POST", "/v1/quarantine/release", {"reason": ctx["args"].reason})
 
 
 def cmd_token(ctx):
@@ -448,7 +483,7 @@ COMMANDS = {
     "init": cmd_init, "up": cmd_up, "down": cmd_down, "status": cmd_status, "doctor": cmd_doctor,
     "events": cmd_events, "ack": cmd_ack, "show": cmd_show, "verify-journal": cmd_verify, "prune": cmd_prune,
     "backup": cmd_backup, "restore": cmd_restore, "restore-confirm": cmd_restore_confirm, "token": cmd_token,
-    "builder": cmd_builder,
+    "builder": cmd_builder, "director": cmd_director, "quarantine": cmd_quarantine,
 }
 
 

@@ -8,7 +8,7 @@ import os
 import pathlib
 import sqlite3
 
-from . import journal
+from . import fsutil, journal, paths
 from .store import Store, meta_get, meta_set
 
 
@@ -16,13 +16,25 @@ class RestoreError(RuntimeError):
     pass
 
 
-def _fsync(path):
-    with open(path, "rb+") as f:
-        os.fsync(f.fileno())
+def check_destination(home, dest):
+    """Refuse destinations that could replace live runtime files [C5]: anything inside the runtime directory
+    except its `backups/` folder, and any existing file (backups never overwrite)."""
+    real = os.path.realpath(dest)
+    home_r = os.path.realpath(home)
+    backups_r = os.path.realpath(paths.backups(home))
+    inside = lambda p, d: os.path.normcase(p).startswith(os.path.normcase(d) + os.sep)
+    if inside(real, home_r) and not inside(real, backups_r):
+        raise ValueError(f"backup destination {dest} is inside the runtime directory; use a path outside it "
+                         "or leave --to empty for the backups folder")
+    if os.path.exists(real):
+        raise ValueError(f"{dest} already exists; backups never overwrite a file")
+    if not os.path.isdir(os.path.dirname(real)):
+        raise ValueError(f"the folder for {dest} does not exist")
+    return real
 
 
 def backup(store, dest):
-    """Write a consistent copy of the live database to `dest` (atomic replace)."""
+    """Write a consistent copy of the live database to `dest`, which must not exist yet."""
     tmp = str(dest) + ".tmp"
     if os.path.exists(tmp):
         os.remove(tmp)
@@ -32,8 +44,9 @@ def backup(store, dest):
             conn.backup(dst)
         finally:
             dst.close()
-    _fsync(tmp)
+    fsutil.fsync_file(tmp)
     os.replace(tmp, dest)
+    fsutil.fsync_dir(os.path.dirname(os.path.abspath(dest)))
     return str(dest)
 
 
@@ -46,6 +59,9 @@ def _validate(src):
             row = conn.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()
             if not row:
                 raise RestoreError(f"{src} is not an Imperium database")
+            if int(row[0]) > Store.SCHEMA_VERSION:
+                raise RestoreError(f"{src} has schema {row[0]}, newer than this Imperium ({Store.SCHEMA_VERSION})")
+            conn.row_factory = sqlite3.Row
             return conn
         except BaseException:
             conn.close()
@@ -54,12 +70,38 @@ def _validate(src):
         raise RestoreError(f"{src} is not a readable Imperium database: {e}") from e
 
 
-def restore(src, db_path):
+def problems(conn):
+    """Imperium's own invariants, beyond SQLite's structure [C7]: the journal chain from its boundary, the
+    head record, and every feed's bookmarks (acked <= shown <= head)."""
+    found = []
+    v = journal.verify_chain(conn)
+    if not v.ok:
+        found.append(f"journal chain broken at event {v.first_bad}: {v.reason}")
+    head_seq, _ = journal.head(conn)
+    for c in conn.execute("SELECT name, acked_seq, shown_through FROM consumers"):
+        if not (0 <= c["acked_seq"] <= c["shown_through"] <= head_seq):
+            found.append(f"feed {c['name']!r} has bookmarks outside the journal "
+                         f"(acked {c['acked_seq']}, shown {c['shown_through']}, head {head_seq})")
+    return found
+
+
+def restore(src, db_path, force=False):
     """Replace the database at `db_path` with the backup `src`. The daemon must not be running.
 
-    The current database is first saved beside it as `<db>.pre-restore-<n>` (with the backup API).
+    The backup must pass SQLite's integrity check and Imperium's invariants; with `force` (owner) a backup
+    that fails the invariants is restored into quarantine instead. The current database is first saved beside
+    it as `<db>.pre-restore-<n>` (with the backup API).
     """
     src_conn = _validate(src)
+    found = []
+    try:
+        if src_conn.execute("SELECT 1 FROM sqlite_master WHERE name='consumers'").fetchone():
+            found = problems(src_conn)
+    except sqlite3.DatabaseError as e:
+        found = [f"cannot check the journal: {e}"]
+    if found and not force:
+        src_conn.close()
+        raise RestoreError("backup refused: " + "; ".join(found))
     try:
         if os.path.exists(db_path):
             n = 1
@@ -86,8 +128,10 @@ def restore(src, db_path):
             head_seq, _ = journal.head(conn)
             journal.append(conn, "RESTORED", "ACTION", caller="owner",
                            data={"backup": os.path.basename(str(src)), "backup_head_seq": head_seq,
-                                 "dispatch": "observe-only until the owner confirms"})
+                                 "dispatch": "observe-only until the owner confirms", "problems": found})
             meta_set(conn, "observe_only", "restored")
+            if found:
+                meta_set(conn, "quarantine", "restored a backup that failed Imperium's checks: " + "; ".join(found))
     finally:
         store.close()
 

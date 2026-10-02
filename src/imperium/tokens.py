@@ -4,7 +4,7 @@ import os
 import re
 import secrets
 
-from . import journal
+from . import fsutil, journal
 
 _SESSION = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
 
@@ -38,6 +38,49 @@ def revoke_principal(conn, principal):
     return cur.rowcount
 
 
+def revoke_except(conn, principal, keep_raw):
+    """Revoke every valid token of `principal` except the one given (finishing a rotation)."""
+    cur = conn.execute("UPDATE tokens SET revoked=? WHERE principal=? AND revoked IS NULL AND hash != ?",
+                       (journal.now(), principal, _digest(keep_raw)))
+    return cur.rowcount
+
+
+def rotate_owner(store, home):
+    """Rotate the owner token without a window where no valid token is on disk [C4].
+
+    1. issue the new token (the old one stays valid) and commit;
+    2. write the locator atomically; if that fails, revoke the new token and stop;
+    3. revoke every other owner token and commit.
+    A crash after step 2 leaves two valid tokens; `finish_rotation` (run at start-up) completes step 3.
+    """
+    with store.tx() as conn:
+        raw = issue(conn, "owner")
+    try:
+        write_locator(home, "owner", raw)
+    except BaseException:
+        with store.tx() as conn:
+            conn.execute("UPDATE tokens SET revoked=? WHERE hash=?", (journal.now(), _digest(raw)))
+        raise
+    with store.tx() as conn:
+        revoke_except(conn, "owner", raw)
+        journal.append(conn, "TOKEN_ROTATED", "NOTICE", caller="owner", data={"principal": "owner"})
+
+
+def finish_rotation(conn, home):
+    """If the owner locator holds a valid token, revoke any other owner token left by an interrupted rotation."""
+    raw = read_locator(home, "owner")
+    if raw and verify(conn, raw) == "owner":
+        n = revoke_except(conn, "owner", raw)
+        if n:
+            journal.append(conn, "TOKEN_ROTATION_FINISHED", "NOTICE", data={"revoked": n})
+        return n
+    return 0
+
+
+def check_principal(principal):
+    _locator_name(principal)
+
+
 def _locator_name(principal):
     if principal == "owner":
         return "owner"
@@ -52,13 +95,7 @@ def _locator_name(principal):
 def write_locator(home, principal, raw):
     d = os.path.join(home, "tokens")
     os.makedirs(d, exist_ok=True)
-    path = os.path.join(d, _locator_name(principal))
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w", encoding="ascii") as f:
-        f.write(raw)
-    if os.name == "posix":
-        os.chmod(path, 0o600)
-    return path
+    return fsutil.atomic_write(os.path.join(d, _locator_name(principal)), raw, mode=0o600)
 
 
 def read_locator(home, principal):

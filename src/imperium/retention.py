@@ -10,7 +10,7 @@ import hashlib
 import json
 import os
 
-from . import journal
+from . import fsutil, journal
 
 PROTECTED = ("ACTION", "CRITICAL")
 
@@ -27,14 +27,7 @@ def sha256_file(path):
     return h.hexdigest()
 
 
-def _fsync_dir(path):
-    if os.name != "posix":  # Windows cannot open a directory for fsync; NTFS journals the rename
-        return
-    fd = os.open(path, os.O_RDONLY)
-    try:
-        os.fsync(fd)
-    finally:
-        os.close(fd)
+_fsync_dir = fsutil.fsync_dir
 
 
 def limit(conn):

@@ -20,10 +20,10 @@ Imperium's job is to make each of these visible and recoverable.
 
 ## What it does (design goals)
 
-1. **Delivers every prompt exactly once**, or records an explicit exception (an uncertain delivery, a confirmed resend). Never a silent duplicate or loss. Prompts go out only when the builder is idle, and delivery is proven by finding the message in the builder's own history.
-2. **Records everything** in one append-only journal with an integrity chain. Each reader has its own feed and bookmark, and the bookmark cannot be moved past what the reader was actually shown.
+1. **Never turns uncertainty into success or into a silent retry.** Every prompt ends in a recorded outcome: not sent, delivered (proven by finding Imperium's own message in the builder's history), delivery uncertain, duplicate detected, or resent by an explicit decision. Against a builder that cannot deduplicate, no outside tool can promise exactly-once delivery; Imperium's promise is that every exception is visible and decided by someone, never guessed. Prompts go out only when the builder is ready (idle, nothing pending, no sub-agent working).
+2. **Records every state change and builder event** in one append-only journal with an integrity chain. (API-call telemetry is kept separately, with bounded retention.) Each reader has its own feed and bookmark, and the bookmark cannot be moved past what the reader was actually shown.
 3. **Tracks rounds of work.** A builder's "done" is a *claim*. It becomes *verified* only when configured checks pass on a snapshot of the code, and *accepted* only by the director or the owner.
-4. **Keeps the owner in control.** Trust-changing actions are owner-only, there is a global stop, and nothing is approved "always" on the owner's behalf.
+4. **Keeps the owner in control.** Trust-changing actions need the owner's credential, there is a global stop, and nothing is approved "always" on the owner's behalf. (Read the security model: on one OS user this is a protocol, not a wall.)
 5. **Runs on one modest machine**: one small Python service, SQLite, no cloud.
 
 ## How it works
@@ -43,7 +43,7 @@ Imperium's job is to make each of these visible and recoverable.
 ```
 
 - **One writer.** Only the service writes the database. A state change, its event and its checkpoint commit together.
-- **Fails closed.** If a write fails, the service stops dispatching and answering, and says so in every reply.
+- **Fails closed.** If a write fails, the service stops dispatching and answering, and says so in every reply. If the journal's integrity chain is broken at start-up, Imperium goes into **quarantine**: reading and backups still work, but nothing that dispatches, decides or changes trust runs until the owner inspects it and releases it with a recorded reason.
 - **Feeds.** Each reader (director, owner) has a feed with a fixed minimum severity. Reading is strictly in order. A drain stops at a high-water mark, so it always ends. Acknowledging beyond what was shown is refused.
 - **Retention.** Only the oldest part of the journal can be pruned, and it is archived first, by a crash-safe protocol. The integrity chain still checks from the prune boundary.
 - **Backups** use SQLite's online backup API. After a restore, the service starts in observe-only mode until the owner confirms.
@@ -51,7 +51,8 @@ Imperium's job is to make each of these visible and recoverable.
 ## Security model: read this
 
 - **Imperium is not a sandbox.** A builder running as your OS user can do anything you can, including reading Imperium's files and acting as the director. A builder hijacked by a malicious web page (prompt injection) is a realistic way for that to happen. If you need containment, run builders as another OS user, in a container or in a VM.
-- The local API listens on `127.0.0.1` only, checks the `Host` and `Origin` headers, and needs a 256-bit bearer token. Tokens are stored hashed, and the runtime folder is owner-only.
+- **"Owner-only" is enforced against software that follows the protocol, not against a hostile process.** The owner's token is a file in your runtime folder; any program running as your OS user, including a builder, can read it and act as the owner. A real boundary needs the builder under another OS user, in a container or a VM. A mode where the service runs under its own identity and is reached through an OS-permissioned pipe or socket is planned.
+- The local API listens on `127.0.0.1` only, checks the `Host` and `Origin` headers (these stop web pages, not local programs), and needs a 256-bit bearer token. Tokens are stored hashed; the runtime folder is readable only by your user.
 - The journal's hash chain detects accidental corruption and naive edits. A process running as the same user could recompute it, so it is an integrity check, not proof.
 
 ## Install (from source, for now)
@@ -80,6 +81,12 @@ imperium down            # stop the service
 
 imperium builder add coding --endpoint http://127.0.0.1:<port> --session <ses_id> \n    --directory <workspace> --password-env OPENCODE_SERVER_PASSWORD   # watch an OpenCode session
 imperium builder list   # registered builders; `imperium status` shows reachability
+
+# inside the Claude Code session that will direct (the owner authorises it):
+imperium --as owner director claim
+imperium status         # now acts as the director, with its own feed
+
+imperium quarantine release --reason "..."   # owner, after inspecting a broken journal
 ```
 
 Once a builder is registered, the service polls it and journals what happens: turns starting and ending, tool errors, permission asks, questions, retries, compactions, and any message that Imperium did not send (shown to you as CRITICAL). Builder text is treated as untrusted: secrets are redacted before anything is stored. The server password is never stored, only the name of the variable (or file) that holds it.

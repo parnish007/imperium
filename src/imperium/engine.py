@@ -58,7 +58,7 @@ class Engine:
 
     def run_once(self, respect_backoff=False):
         with self.lock:
-            if self.d.store.failed:
+            if self.d.store.failed or self.d.quarantine():
                 return
             with self.d.store.read() as conn:
                 rows = builders.list_(conn)
@@ -76,7 +76,7 @@ class Engine:
         name = b["name"]
         h = self.health.setdefault(name, {"failures": 0, "reachable": None, "next": 0.0, "auth_failed": False,
                                           "last_error": None})
-        if respect_backoff and time.monotonic() < h["next"]:
+        if h.get("halted") or (respect_backoff and time.monotonic() < h["next"]):
             return
         try:
             pw = builders.password(b)
@@ -114,6 +114,13 @@ class Engine:
                 self._event(b, "ADAPTER_ERROR", "NOTICE", {"error": type(e).__name__,
                                                            "note": "OpenCode returned an unexpected shape"})
             self._backoff(h)
+            return
+        except journal.SourceKeyConflict as e:
+            # An adapter produced two different observations under one key: stop reading this builder
+            # rather than guess which one is true. Restarting the daemon retries.
+            h["halted"] = True
+            self._event(b, "SOURCE_KEY_CONFLICT", "CRITICAL", {"error": str(e)[:300],
+                        "effect": "this builder is no longer read until the daemon restarts"})
             return
         except StoreFailed:
             return

@@ -17,6 +17,10 @@ GENESIS = "0" * 64
 VerifyResult = collections.namedtuple("VerifyResult", "ok checked first_bad reason")
 
 
+class SourceKeyConflict(ValueError):
+    """The same idempotency key arrived with different content: an adapter bug, never silently ignored."""
+
+
 def rank(severity):
     try:
         return RANK[severity]
@@ -53,14 +57,23 @@ def append(conn, type_, severity, *, builder=None, data=None, untrusted=None, so
     (exactly-once ingestion of adapter observations [R-2]).
     """
     sev = rank(severity)
+    data_s = _dump(data if data is not None else {})
+    digest = None
     if source_key is not None:
-        row = conn.execute("SELECT seq FROM events WHERE source_key=?", (source_key,)).fetchone()
+        # Keys live in their own table, which pruning never touches, and are bound to the content [C8].
+        digest = hashlib.sha256(json.dumps([type_, builder, data_s]).encode("utf-8")).hexdigest()
+        row = conn.execute("SELECT digest, seq FROM source_keys WHERE key=?", (source_key,)).fetchone()
         if row:
-            return row[0]
+            if row[0] == "pre-v3":  # keys migrated from schema 2 had no digest: bind them now
+                conn.execute("UPDATE source_keys SET digest=? WHERE key=?", (digest, source_key))
+                return row[1]
+            if row[0] != digest:
+                raise SourceKeyConflict(f"source key {source_key!r} was journaled as event {row[1]} with "
+                                        "different content")
+            return row[1]
     head_seq, prev_hash = head(conn)
     seq = max(head_seq, _sequence(conn)) + 1
     ts = now()
-    data_s = _dump(data if data is not None else {})
     untrusted_s = _dump(untrusted)
     caller_s = caller
     h = _hash(seq, ts, builder, type_, sev, data_s, untrusted_s, source_key, caller_s, prev_hash)
@@ -70,6 +83,8 @@ def append(conn, type_, severity, *, builder=None, data=None, untrusted=None, so
         (seq, ts, builder, type_, sev, data_s, untrusted_s, source_key, caller_s, prev_hash, h))
     meta_set(conn, "head_seq", seq)
     meta_set(conn, "head_hash", h)
+    if source_key is not None:
+        conn.execute("INSERT INTO source_keys(key, digest, seq) VALUES(?,?,?)", (source_key, digest, seq))
     return seq
 
 
@@ -110,12 +125,31 @@ def boundary(conn):
     return (r[0], r[1]) if r else (0, GENESIS)
 
 
+def _has_anchors(conn):
+    return conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='anchors'").fetchone() is not None
+
+
+def anchor(conn):
+    """(seq, hash) of the newest owner-accepted break, or (0, GENESIS). Older schemas have none."""
+    if not _has_anchors(conn):
+        return 0, GENESIS
+    r = conn.execute("SELECT seq, hash FROM anchors ORDER BY seq DESC LIMIT 1").fetchone()
+    return (r[0], r[1]) if r else (0, GENESIS)
+
+
+def accepted_breaks(conn):
+    if not _has_anchors(conn):
+        return []
+    return [{"anchored_at_seq": r["seq"], "first_bad": r["first_bad"], "reason": r["reason"], "ts": r["ts"]}
+            for r in conn.execute("SELECT * FROM anchors ORDER BY seq")]
+
+
 def verify_chain(conn):
-    """Recompute every hash from the newest prune boundary to the recorded head."""
-    _, expected_prev = boundary(conn)
+    """Recompute every hash from the newest prune boundary or owner-accepted break to the recorded head."""
+    start, expected_prev = max(boundary(conn), anchor(conn))
     checked = 0
     last_seq, last_hash = 0, expected_prev
-    for r in conn.execute("SELECT * FROM events ORDER BY seq"):
+    for r in conn.execute("SELECT * FROM events WHERE seq > ? ORDER BY seq", (start,)):
         if r["prev_hash"] != expected_prev:
             return VerifyResult(False, checked, r["seq"], "link broken (an event is missing or was replaced)")
         h = _hash(r["seq"], r["ts"], r["builder"], r["type"], r["severity"], r["data"], r["untrusted"],

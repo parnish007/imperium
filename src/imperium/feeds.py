@@ -34,6 +34,12 @@ def create(conn, name, *, principal, floor):
                  "VALUES(?,?,?,?,?,?)", (name, principal, fl, 0, 0, journal.now()))
 
 
+def reassign(conn, name, principal):
+    """Give a feed to a new principal (the director role changing sessions); its bookmark is kept."""
+    get(conn, name)
+    conn.execute("UPDATE consumers SET principal=? WHERE name=?", (principal, name))
+
+
 def get(conn, name):
     r = conn.execute("SELECT * FROM consumers WHERE name=?", (name,)).fetchone()
     if not r:
@@ -59,8 +65,9 @@ def events_since(conn, name, principal, *, limit=50, after=None, high_water=None
         raise FeedError("limit must be between 1 and 500")
     c = _own(conn, name, principal)
     floor = journal.rank(c["floor"])
-    if high_water is None:
-        high_water = journal.head(conn)[0]
+    head = journal.head(conn)[0]
+    # The server owns the bound: a client-supplied high-water mark is never above the current head [C1].
+    high_water = head if high_water is None else max(0, min(int(high_water), head))
     start = c["acked_seq"] if after is None else max(int(after), 0)
     rows = conn.execute(
         "SELECT * FROM events WHERE seq > ? AND seq <= ? AND severity >= ? ORDER BY seq LIMIT ?",

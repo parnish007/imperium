@@ -73,6 +73,30 @@ SCHEMA = [
         updated TEXT NOT NULL
     );
     """,
+    # version 3: durable idempotency keys, owner-accepted chain breaks, director registrations
+    """
+    CREATE TABLE source_keys(
+        key TEXT PRIMARY KEY,
+        digest TEXT NOT NULL,
+        seq INTEGER NOT NULL
+    );
+    INSERT INTO source_keys(key, digest, seq)
+        SELECT source_key, 'pre-v3', seq FROM events WHERE source_key IS NOT NULL;
+    CREATE TABLE anchors(
+        seq INTEGER PRIMARY KEY,
+        hash TEXT NOT NULL,
+        first_bad INTEGER,
+        reason TEXT NOT NULL,
+        ts TEXT NOT NULL
+    );
+    CREATE TABLE directors(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        session_id TEXT NOT NULL,
+        claimed_at TEXT NOT NULL,
+        claimed_by TEXT NOT NULL,
+        released_at TEXT
+    );
+    """,
 ]
 
 
@@ -134,10 +158,10 @@ class Store:
             try:
                 yield self.conn
                 self.conn.execute("COMMIT")
-            except sqlite3.IntegrityError:
-                self._rollback()
-                raise
             except sqlite3.Error as e:
+                # Every database error fails closed, constraint violations included: expected conflicts are
+                # checked before writing and refused with their own exceptions, so a constraint violation
+                # here means Imperium broke one of its own invariants [C14].
                 self._rollback()
                 self.failed = f"journal write failed: {e}"
                 raise StoreFailed(self.failed) from e
