@@ -32,5 +32,3 @@ secrets*
 .DS_Store
 Thumbs.db
 
-# Tests are kept locally, not published
-tests/

@@ -113,7 +113,13 @@ Later: an Agent Client Protocol (ACP) adapter, dashboard controls, a reviewer mo
 
 ## Development
 
-The core uses only the Python standard library (Python 3.11 or newer). No other dependency is needed to run it.
+The core uses only the Python standard library (Python 3.11 or newer). The tests are part of the product: crash and fault cases, tampering, restore, idempotency, history catch-up and a fake OpenCode server with its known quirks. Run them with:
+
+```
+PYTHONPATH=src python -m unittest discover -s tests
+```
+
+One test starts and stops a real background service.
 
 ## Licence
 
