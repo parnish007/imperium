@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Imperium runtime data (never commit a database, token or archive)
+.imperium/
+*.db
+*.db-wal
+*.db-shm
+tokens/
+archive/
+backups/
+logs/
+
+# Secrets and local settings
+.env
+*.env
+secrets*
+*.local.toml
+
+# Editors and OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Tests are kept locally, not published
+tests/
