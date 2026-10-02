@@ -286,6 +286,8 @@ def r_show(d, principal, body, query):
 
 def r_verify(d, principal, body, query):
     c = d.refresh_chain()
+    if not c["ok"]:
+        d.enter_quarantine(c)
     return {"chain_ok": c["ok"], "checked": c["checked"], "first_bad": c["first_bad"], "reason": c["reason"],
             "checked_through_seq": c["checked_through_seq"], "accepted_breaks": c["accepted_breaks"]}
 
@@ -544,6 +546,16 @@ class Daemon:
         self.chain = {"ok": r.ok, "checked": r.checked, "first_bad": r.first_bad, "reason": r.reason,
                       "checked_at": journal.now(), "checked_through_seq": head_seq, "accepted_breaks": breaks}
         return self.chain
+
+    def enter_quarantine(self, chain):
+        """A break found while running quarantines exactly like one found at start-up [C6]."""
+        with self.store.tx() as conn:
+            if meta_get(conn, "quarantine"):
+                return
+            journal.append(conn, "INTEGRITY_FAIL", "CRITICAL",
+                           data={"first_bad": chain["first_bad"], "reason": chain["reason"]})
+            meta_set(conn, "quarantine", f"journal chain broken at event {chain['first_bad']}: {chain['reason']}")
+            journal.append(conn, "QUARANTINED", "CRITICAL", data={"reason": "journal chain broken"})
 
     def _recover(self):
         r = self.refresh_chain()

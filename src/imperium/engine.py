@@ -108,19 +108,19 @@ class Engine:
                 return
             self._fail(b, h, f"http {e.status}", str(e))
             return
-        except (KeyError, TypeError, ValueError, AttributeError) as e:  # a response of an unexpected shape [R-20]
-            if h["last_error"] != f"malformed: {type(e).__name__}":
-                h["last_error"] = f"malformed: {type(e).__name__}"
-                self._event(b, "ADAPTER_ERROR", "NOTICE", {"error": type(e).__name__,
-                                                           "note": "OpenCode returned an unexpected shape"})
-            self._backoff(h)
-            return
         except journal.SourceKeyConflict as e:
             # An adapter produced two different observations under one key: stop reading this builder
             # rather than guess which one is true. Restarting the daemon retries.
             h["halted"] = True
             self._event(b, "SOURCE_KEY_CONFLICT", "CRITICAL", {"error": str(e)[:300],
                         "effect": "this builder is no longer read until the daemon restarts"})
+            return
+        except (KeyError, TypeError, ValueError, AttributeError) as e:  # a response of an unexpected shape [R-20]
+            if h["last_error"] != f"malformed: {type(e).__name__}":
+                h["last_error"] = f"malformed: {type(e).__name__}"
+                self._event(b, "ADAPTER_ERROR", "NOTICE", {"error": type(e).__name__,
+                                                           "note": "OpenCode returned an unexpected shape"})
+            self._backoff(h)
             return
         except StoreFailed:
             return

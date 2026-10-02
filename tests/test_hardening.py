@@ -249,3 +249,89 @@ class TestC16ChainStatus(DaemonBase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestCodexS4Findings(unittest.TestCase):
+    """Findings from the stage-4 Codex review (interim notes, verified against the code)."""
+
+    def test_restore_crash_before_swap_keeps_the_old_database(self):
+        with tempfile.TemporaryDirectory() as d:
+            db = os.path.join(d, "imperium.db")
+            s = Store(db)
+            with s.tx() as c:
+                journal.append(c, "OLD", "INFO")
+            bk = os.path.join(d, "b.db")
+            backup.backup(s, bk)
+            with s.tx() as c:
+                journal.append(c, "NEWER", "INFO")
+            s.close()
+            with mock.patch.object(backup.os, "replace", side_effect=OSError("power cut")):
+                with self.assertRaises(OSError):
+                    backup.restore(bk, db)
+            s = Store(db)
+            with s.read() as c:
+                self.assertEqual([r[0] for r in c.execute("SELECT type FROM events ORDER BY seq")], ["OLD", "NEWER"])
+                self.assertTrue(journal.verify_chain(c).ok)
+            s.close()
+
+    def test_restored_database_is_observe_only_before_it_is_in_place(self):
+        with tempfile.TemporaryDirectory() as d:
+            db = os.path.join(d, "imperium.db")
+            s = Store(db)
+            with s.tx() as c:
+                journal.append(c, "OLD", "INFO")
+            bk = os.path.join(d, "b.db")
+            backup.backup(s, bk)
+            s.close()
+            seen = {}
+            real_replace = os.replace
+
+            def spy(src, dst):
+                if dst == db:  # inspect the file that is about to become the live database
+                    conn = sqlite3.connect(src)
+                    seen["flag"] = conn.execute("SELECT value FROM meta WHERE key='observe_only'").fetchone()
+                    conn.close()
+                return real_replace(src, dst)
+
+            with mock.patch.object(backup.os, "replace", side_effect=spy):
+                backup.restore(bk, db)
+            self.assertEqual(seen["flag"], ("restored",))
+
+    def test_runtime_verify_that_finds_a_break_quarantines(self):
+        h = TempHome().init().start()
+        try:
+            c = h.client()
+            s = Store(os.path.join(h.home, "imperium.db"))
+            with s.tx() as conn:
+                conn.execute("UPDATE events SET type='TAMPERED' WHERE seq=1")
+            s.close()
+            v = c.call("GET", "/v1/verify-journal")
+            self.assertFalse(v["chain_ok"])
+            self.assertTrue(c.call("GET", "/v1/status")["quarantine"])
+        finally:
+            h.cleanup()
+
+    def test_source_key_conflict_halts_the_builder(self):
+        from fake_opencode import FakeOpenCode
+        fake = FakeOpenCode()
+        fake.add_session("ses_k", "/work/k")
+        h = TempHome("[opencode]\npoll_interval = 3600.0\n").init().start()
+        try:
+            rc, body = run(h.home, "builder", "add", "kb", "--endpoint", fake.url, "--session", "ses_k",
+                           "--directory", "/work/k")
+            self.assertEqual(rc, 0, body)
+            h.d.engine.run_once()
+            fake.add_user("ses_k", "[imperium msg=A builder=kb]\n.")
+            mid = fake.messages["ses_k"][-1]["info"]["id"]
+            with h.d.store.tx() as conn:  # a key already journaled with different content
+                conn.execute("INSERT INTO source_keys(key, digest, seq) VALUES(?, 'other', 1)", (f"oc:ses_k:{mid}:user",))
+            h.d.engine.run_once()
+            h.d.engine.run_once()
+            with h.d.store.read() as conn:
+                types = [r[0] for r in conn.execute("SELECT type FROM events ORDER BY seq")]
+            self.assertEqual(types.count("SOURCE_KEY_CONFLICT"), 1)
+            self.assertNotIn("ADAPTER_ERROR", types)
+            self.assertTrue(h.d.engine.health["kb"].get("halted"))
+        finally:
+            h.cleanup()
+            fake.close()
