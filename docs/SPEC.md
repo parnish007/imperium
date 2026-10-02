@@ -20,20 +20,22 @@ back from it to the owner's token.
 the protocol (a builder running shell commands) can read the token files and the database. "Owner-only" therefore
 holds against software that follows the protocol, not against a hostile builder. **Isolation mode** (see
 [ISOLATION.md](ISOLATION.md)) runs builders under their own account: the API is reached through named pipes
-(Windows, with access lists) or Unix sockets (Linux and macOS) that admit only the configured accounts, the operating system identifies the account at the other end of
-each connection, a builder token is accepted only on the builder pipe and every other token only on the owner pipe,
+(Windows, with access lists) or Unix sockets (Linux and macOS) that admit only the configured accounts (a
+client gets read and write, never the right to create another instance of the pipe); the operating system
+identifies the account at the other end of each connection (on Windows from the client's own security context,
+at identification level); a builder token is accepted only on the builder pipe and every other token only on the owner pipe,
 and the TCP port accepts only the read-only dashboard.
 
 ## 2. Guarantees
 
 | ID | Guarantee | Holds when | Does not hold |
 |---|---|---|---|
-| E1 | Every message ends in a recorded outcome: **ran** (ADMITTED), **delivered** but not yet run, **uncertain**, **stranded**, **cancelled**, **rejected**, or **replaced** by an explicit resend | always; nothing is dropped silently | — |
+| E1 | Every message is always in a recorded state, and every way it can end is recorded: **ran** (ADMITTED), **uncertain**, **stranded**, **cancelled**, **rejected**, or **replaced** by an explicit resend | always; nothing is dropped silently | a message for a builder that stays blocked stays QUEUED; that is reported (`DISPATCH_STALLED`), not resolved |
 | E2 | Imperium never posts a message twice on its own | always | a principal's confirmed resend may make the builder run it twice; if both run, a CRITICAL `DUPLICATE_RAN` event says so |
 | E3 | A message counts as delivered only when its own id is in the builder's history, and as run only when the builder replies to that id | the builder keeps its history | OpenCode runs its database with `synchronous=NORMAL`: a power loss can make it forget a message it had saved |
-| F1 | Every event at or above a feed's floor is shown to that feed at least once, in order, and is never marked read without having been shown | always | — |
+| F1 | Every event at or above a feed's floor is shown to that feed at least once, in order, and cannot be marked read before the server has returned it | always; a reader that loses a response reads again from its unchanged bookmark | a reader that acknowledges a number it never received |
 | V1 | `VERIFIED` means: the builder claimed done for the current generation, every required trusted check passed on a snapshot of that generation, the checks' own files were unchanged, and a principal judged the objective met | the builder cannot edit Imperium's store or the files outside its workspace that held-out checks use | under one OS user a hostile builder can do both (§1) |
-| A1 | A round is accepted only by a named principal's decision, on the verified snapshot, with an unchanged workspace | always; the owner may override, and the override is journaled | — |
+| A1 | A round is accepted only by a named principal's decision, on the verified snapshot (an immutable commit), with the workspace equal to it at the moment of the decision | always; the owner may override, and the override is journaled | a process the builder left running can change the workspace after the decision; what was accepted is the commit |
 | J1 | The journal is hash-chained; a break found at start-up, on demand, or by the periodic check quarantines Imperium | the chain is an integrity check | a same-user process can recompute the chain: it detects accidents and naive edits, not a determined forger |
 
 ## 3. Delivery
@@ -92,38 +94,52 @@ PENDING → OPEN → CLAIMED_READY | CLAIMED_INCOMPLETE → VERIFIED → ACCEPTE
   every check that applies:
   1. compare each file the check depends on with the hash recorded when the check was defined: a difference makes
      the round's checks **untrusted** (ACTION) and VERIFIED impossible until the *owner* approves the new versions;
-  2. run it in a fresh worktree of the snapshot (never in the live workspace), argv only, no shell, a minimal
-     environment plus the check's allow-list, with its timeout (the whole process tree is killed);
+  2. run it in a fresh copy of the snapshot (never in the live workspace), argv only, no shell, a minimal
+     environment plus the check's allow-list, with its timeout. Output goes to a file, so a leftover process
+     cannot hold the check open. On Windows the check runs in a job object that kills everything it started
+     when it ends, also detached processes; on Linux and macOS its process group is killed, and a process that
+     started its own session escapes (run checks in a container if that matters);
   3. if `must_fail_on_base`, run it on the base too: passing there means it does not test the change;
   4. record provenance: check id and version, argv, resolved executable and its hash, environment names and value
      hashes, snapshot tree, exit code, duration, output hash, the redacted output file.
   Changed test files are flagged (`TEST_FILES_CHANGED`).
 - **Objective.** A principal records `met` or `not met` for the current generation. VERIFIED needs it.
-- **Decision.** The first committed decision wins. Accept needs VERIFIED and a workspace whose tree still equals the
-  verified snapshot; only the owner can override, and the override is journaled. A decision cancels the round's
-  queued messages.
+- **Voiding.** Evidence stands only for what it covered. Requesting verification again, or defining a check (or a
+  new version of one) that applies to the round, voids it: a VERIFIED round goes back to CLAIMED_READY
+  (`VERIFICATION_VOIDED`, ACTION). Results of a run during which the checks changed, or the journal was
+  quarantined, are not used.
+- **Decision.** The first committed decision wins. Accept needs VERIFIED with the checks passed on this generation's
+  snapshot, no verification running, an idle builder, and a workspace whose tree equals the verified snapshot; the
+  builder's reservation is held from that comparison to the commit, so nothing is sent to it in between. Only the
+  owner can override, and the override is journaled. A decision cancels every queued message of the round, and a
+  message for a decided round is cancelled at dispatch, never sent.
 
 Snapshots are built in a temporary git index (uncommitted and unstaged work included, the builder's index
 untouched), kept under `refs/imperium/...` so garbage collection keeps them. `.imperium/` is never in a snapshot.
 The builder controls its repository's `.git/config` and `.gitattributes`, so nothing Imperium runs there may execute
 them: files are hashed raw (`hash-object --no-filters`, never `git add`), a check's copy is written from raw object
 contents (never a checkout or `git archive`, which apply smudge filters), diffs run with `--no-ext-diff
---no-textconv`, commits are never signed, hooks and fsmonitor are off. Plain `git push` does not send
+--no-textconv`, commits are never signed, hooks and fsmonitor are off. Repositories with submodules are refused:
+a submodule's own changes would be invisible to the snapshot. Plain `git push` does not send
 `refs/imperium/*`; `git push --mirror` would.
 
 ## 5. Approvals and questions
 
-- OpenCode's own permission configuration decides first; only its `ask` cases reach Imperium.
+- OpenCode's own permission configuration decides first; only its `ask` cases reach Imperium. An ask is stored
+  with at most 50 patterns of 2,000 characters; an ask that may have been cut is never answered by an allow rule
+  (deny rules still apply).
 - **Rules** (*owner*): permission glob, pattern glob, optional `path_under` directory, allow or deny, optional
   builder. Deny wins. An allow rule must cover every pattern of the ask; a deny rule fires on any one.
 - **Automatic answers** happen only while the registered director is **present**: one of its own calls (reading or
   acknowledging its feed, deciding something, or its PostToolUse hook) within `lease_ttl` (15 min), in this daemon
   run. The owner's calls do not count. A matching ask without a present director is **HELD**; a held ask is
   released only by a decision by hand. Every automatic answer is journaled with its rule; `imperium approvals --auto`
-  lists them and `status` counts the ones not yet reviewed.
+  lists the ones not yet reviewed, oldest first, and marks reviewed exactly what it listed (nothing when filtered
+  by builder); `status` counts the rest.
 - **By hand:** `once` or `reject` by the director or owner; `always` is the owner's. The first decision wins.
 - **Replies are operations:** committed with the decision, sent, retried every cycle (also after a restart) until
-  OpenCode confirms or no longer lists the ask. An ask OpenCode stops listing while undecided is EXPIRED.
+  OpenCode confirms or no longer lists the ask. Under stop-all or quarantine only rejections are sent; a decided
+  `once` or an answer waits for `resume-all`. An ask OpenCode stops listing while undecided is EXPIRED.
 - **Questions** are answered by hand with OpenCode's structure: one list of chosen labels per question; a
   single-choice question takes one label.
 - **Path rules** are a tripwire: while a builder can run shell commands it can reach any path, and a symlink can
@@ -167,7 +183,8 @@ SQLite in WAL mode with `synchronous=FULL`, one writing process. A database erro
 refused until restart), except a lock timeout, which refuses only that write. The journal chain is verified at
 start-up, on demand and every `verify_interval` (300 s). A break quarantines: reads, feed acknowledgements, backups,
 stop-all and cancel still work; everything that sends or decides waits for the owner's `quarantine release`, which
-records an accepted region; edits before or after that region are still caught. Backups use SQLite's online backup
+records an accepted region; edits before or after that region are still caught. A running verification publishes
+nothing once quarantine has begun. Backups use SQLite's online backup
 API. Restore validates the chain, the head and the feed bookmarks, is crash-safe (prepared beside the database,
 swapped in one rename), and starts observe-only until the owner confirms.
 

@@ -150,8 +150,19 @@ class TestAccessList(unittest.TestCase):
     def test_sddl_is_protected_and_lists_only_the_given_accounts(self):
         d = transport.sddl(["S-1-5-21-1-2-3-1001"])
         self.assertTrue(d.startswith("D:P(A;;GA;;;SY)"))
-        self.assertIn("(A;;GA;;;S-1-5-21-1-2-3-1001)", d)
         self.assertNotIn("WD", d)  # never Everyone
+        ace = [a for a in d.split("(") if a.endswith("S-1-5-21-1-2-3-1001)")]
+        self.assertEqual(len(ace), 1)
+        rights = int(ace[0].split(";")[2], 16)  # an explicit mask: never GA for a client account
+        self.assertEqual(rights & 0x4, 0)  # FILE_CREATE_PIPE_INSTANCE: could stand up a fake daemon pipe
+        self.assertEqual(rights & (0x40000 | 0x80000 | 0x10000), 0)  # WRITE_DAC, WRITE_OWNER, DELETE
+        self.assertEqual(rights & 0x3, 0x3)  # read and write data
+
+    def test_a_client_cannot_create_an_instance_of_the_pipe(self):
+        # The test runs as the daemon's own account, so check what a client *asks for*: the rights a client opens
+        # the pipe with must not include creating instances (the access list then refuses that to builders).
+        self.assertEqual(transport.CLIENT_OPEN & 0x4, 0)
+        self.assertEqual(transport.CLIENT_OPEN & ~transport.CLIENT_RIGHTS, 0)
 
 
 @unittest.skipIf(WINDOWS, "Unix sockets")

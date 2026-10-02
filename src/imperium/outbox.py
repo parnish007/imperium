@@ -78,8 +78,10 @@ def list_(conn, builder=None, states=None, limit=200):
     if states:
         q += f" AND state IN ({','.join('?' * len(states))})"
         args += list(states)
-    q += " ORDER BY created, rowid LIMIT ?"
-    args.append(limit)
+    q += " ORDER BY created, rowid"
+    if limit is not None:
+        q += " LIMIT ?"
+        args.append(limit)
     return [_row(r) for r in conn.execute(q, args)]
 
 
@@ -169,7 +171,7 @@ def release(conn, builder, who):
 
 
 def next_queued(conn, builder, owner_only=False):
-    rows = [m for m in list_(conn, builder, [QUEUED]) if not owner_only or m["source"] == "owner"]
+    rows = [m for m in list_(conn, builder, [QUEUED], limit=None) if not owner_only or m["source"] == "owner"]
     rows.sort(key=lambda m: (SOURCE_ORDER.get(m["source"], 9), m["created"]))
     return rows[0] if rows else None
 

@@ -4,8 +4,8 @@ On Windows: named pipes whose access list (DACL) admits only the accounts named 
 FILE_FLAG_FIRST_PIPE_INSTANCE (a process that grabbed the name first makes the daemon refuse to start, instead of
 being talked to) and PIPE_REJECT_REMOTE_CLIENTS. On Linux/macOS: Unix sockets in a private directory that others
 may only traverse (0711), the owner socket 0600; a directory another account could have prepared is refused. Every
-connection is identified by the operating system: the account of the process at the other end (Windows:
-GetNamedPipeClientProcessId -> process token -> user SID; Unix: SO_PEERCRED / getpeereid). The same HTTP API runs
+connection is identified by the operating system: the account of the process at the other end (Windows: the
+client's security context at identification level -> user SID; Unix: SO_PEERCRED / getpeereid). The same HTTP API runs
 over the channel, so nothing above the transport changes.
 
 Two channels: `owner` (the owner and the director, who run as the owner's account) and `builder` (builders, under
@@ -62,6 +62,15 @@ if os.name == "nt":
     adv.ConvertStringSecurityDescriptorToSecurityDescriptorW.argtypes = [wt.LPCWSTR, wt.DWORD,
                                                                          ctypes.POINTER(wt.LPVOID), wt.LPVOID]
     k32.LocalFree.argtypes = [wt.HLOCAL]
+    k32.GetCurrentThread.restype = wt.HANDLE
+    adv.ImpersonateNamedPipeClient.argtypes = [wt.HANDLE]
+    adv.OpenThreadToken.argtypes = [wt.HANDLE, wt.DWORD, wt.BOOL, ctypes.POINTER(wt.HANDLE)]
+    # What a client may do with a pipe: read, write, attributes, wait. Not FILE_CREATE_PIPE_INSTANCE (0x4: a
+    # client holding it could stand up its own instance of the daemon's pipe and receive other clients' tokens),
+    # not WRITE_DAC, WRITE_OWNER or DELETE (S5 review C8).
+    CLIENT_RIGHTS = 0x1 | 0x2 | 0x80 | 0x100 | 0x20000 | 0x100000
+    CLIENT_OPEN = 0x1 | 0x2 | 0x80 | 0x100 | 0x100000  # what a client asks for when it opens the pipe
+    SECURITY_SQOS_PRESENT, SECURITY_IDENTIFICATION = 0x00100000, 0x00010000
 
 
 class TransportError(RuntimeError):
@@ -81,6 +90,11 @@ def _process_sid(hproc, own=False):
     tok = wt.HANDLE()
     if not adv.OpenProcessToken(hproc, 0x0008, ctypes.byref(tok)):  # TOKEN_QUERY
         raise TransportError(f"OpenProcessToken failed ({ctypes.get_last_error()})")
+    return _token_sid(tok)
+
+
+def _token_sid(tok):
+    """The user SID of a token, as a string; closes the token."""
     try:
         need = wt.DWORD()
         adv.GetTokenInformation(tok, 1, None, 0, ctypes.byref(need))  # TokenUser
@@ -100,16 +114,23 @@ def _process_sid(hproc, own=False):
 
 
 def peer_sid(handle):
-    pid = wt.ULONG()
-    if not k32.GetNamedPipeClientProcessId(handle, ctypes.byref(pid)):
-        raise TransportError("cannot identify the process at the other end of the pipe")
-    hp = k32.OpenProcess(0x1000, False, pid.value)  # PROCESS_QUERY_LIMITED_INFORMATION
-    if not hp:
-        raise TransportError(f"cannot open the peer process {pid.value} ({ctypes.get_last_error()})")
+    """The account at the other end of the pipe. Taken from the client's own security context by impersonating
+    it at identification level, which needs no access to the client's process: opening another account's process
+    token needs a privilege an ordinary account lacks (S5 review C9). Call only after reading from the pipe (the
+    context is that of the last message read). Impersonation is always reverted; if that ever fails the daemon
+    stops rather than go on acting as the client."""
+    if not adv.ImpersonateNamedPipeClient(handle):
+        raise TransportError(f"cannot identify the pipe client ({ctypes.get_last_error()})")
+    tok = wt.HANDLE()
     try:
-        return _process_sid(hp)
+        ok = adv.OpenThreadToken(k32.GetCurrentThread(), 0x0008, True, ctypes.byref(tok))  # TOKEN_QUERY, as self
+        err = ctypes.get_last_error()
     finally:
-        k32.CloseHandle(hp)
+        if not adv.RevertToSelf():
+            os._exit(70)
+    if not ok:
+        raise TransportError(f"cannot read the pipe client's identity ({err})")
+    return _token_sid(tok)
 
 
 def pipe_name(home, channel):
@@ -120,18 +141,21 @@ def pipe_name(home, channel):
 
 
 def sddl(allowed_sids):
-    """Protected DACL: full access for SYSTEM, the daemon's own account, and the allowed accounts; nobody else."""
+    """Protected DACL: full access for SYSTEM and the daemon's own account; read and write, and nothing more, for
+    the allowed accounts; nobody else."""
     me = current_identity()
-    sids = []
-    for s in [me] + list(allowed_sids):
-        if s not in sids:
-            sids.append(s)
-    return "D:P(A;;GA;;;SY)" + "".join(f"(A;;GA;;;{s})" for s in sids)
+    others = []
+    for sid in allowed_sids:
+        if sid != me and sid not in others:
+            others.append(sid)
+    return (f"D:P(A;;GA;;;SY)(A;;GA;;;{me})"
+            + "".join(f"(A;;0x{CLIENT_RIGHTS:x};;;{sid})" for sid in others))
 
 
 class _PipeIO(io.RawIOBase):
-    def __init__(self, handle):
+    def __init__(self, handle, first=b""):
         self.h = handle
+        self.first = first  # bytes already read (to identify the client) and not yet consumed
 
     def readable(self):
         return True
@@ -139,7 +163,17 @@ class _PipeIO(io.RawIOBase):
     def writable(self):
         return True
 
+    def read_some(self, size=65536):
+        buf = bytearray(size)
+        n = self.readinto(buf)
+        return bytes(buf[:n])
+
     def readinto(self, b):
+        if self.first:
+            n = min(len(b), len(self.first))
+            b[:n] = self.first[:n]
+            self.first = self.first[n:]
+            return n
         n = wt.DWORD()
         buf = (ctypes.c_char * len(b)).from_buffer(b)
         if not k32.ReadFile(self.h, buf, len(b), ctypes.byref(n), None):
@@ -165,9 +199,9 @@ class _PipeIO(io.RawIOBase):
 class _PipeSock:
     """Enough of a socket for http.server and http.client."""
 
-    def __init__(self, handle):
+    def __init__(self, handle, first=b""):
         self.h = handle
-        self.raw = _PipeIO(handle)
+        self.raw = _PipeIO(handle, first)
 
     def makefile(self, mode="rb", buffering=None, **kw):
         if "r" in mode:
@@ -239,6 +273,9 @@ class PipeServer:
     def _serve(self, h):
         served = False
         try:
+            first = _PipeIO(h).read_some()  # the client's identity is that of the last message read
+            if not first:
+                return
             try:
                 sid = peer_sid(h)
             except TransportError:
@@ -246,7 +283,7 @@ class PipeServer:
             if sid not in self.allowed:
                 return
             served = True
-            self.handler_class(_PipeSock(h), ("pipe", self.channel, sid), self.server)
+            self.handler_class(_PipeSock(h, first), ("pipe", self.channel, sid), self.server)
         except Exception:  # one bad client must not stop the server
             pass
         finally:
@@ -270,7 +307,10 @@ def pipe_request(name, raw_request, timeout_ms=5000):
     import http.client
     if not k32.WaitNamedPipeW(name, timeout_ms):
         raise ConnectionError(f"{name} is not available ({ctypes.get_last_error()})")
-    h = k32.CreateFileW(name, GENERIC_READ | GENERIC_WRITE, 0, None, OPEN_EXISTING, 0, None)
+    # only the rights the access list grants clients; identification level, so the server can learn who we are
+    # but cannot act as us
+    h = k32.CreateFileW(name, CLIENT_OPEN, 0, None, OPEN_EXISTING, SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION,
+                        None)
     if h == INVALID_HANDLE or h is None:
         raise ConnectionError(f"cannot open {name} ({ctypes.get_last_error()}): is this account allowed?")
     try:

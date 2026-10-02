@@ -17,7 +17,7 @@ import threading
 import time
 
 from . import journal, outbox, rounds, snapshot, untrusted
-from .store import StoreFailed
+from .store import StoreFailed, meta_get
 
 log = logging.getLogger("imperiumd.verify")
 BASE_ENV = ("PATH", "PATHEXT", "SYSTEMROOT", "SYSTEMDRIVE", "WINDIR", "COMSPEC", "TEMP", "TMP", "HOME", "USERPROFILE",
@@ -45,32 +45,110 @@ def run_check(argv, cwd, env_names, timeout, out_path, secrets=()):
     else:
         kw["start_new_session"] = True
     started = time.monotonic()
-    timed_out = False
-    try:
-        p = subprocess.Popen([exe] + list(argv[1:]), cwd=cwd, env=env, stdout=subprocess.PIPE,
-                             stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, **kw)
-    except OSError as e:
-        raw = f"could not start {argv[0]}: {e}".encode()
-        code = None
-    else:
-        try:
-            raw, _ = p.communicate(timeout=timeout)
-        except subprocess.TimeoutExpired:
-            timed_out = True
-            _kill_tree(p)
-            raw, _ = p.communicate()
-        code = p.returncode
-    duration = time.monotonic() - started
-    digest = hashlib.sha256(raw).hexdigest()
-    text = raw[:OUTPUT_CAP].decode("utf-8", "replace")
-    if len(raw) > OUTPUT_CAP:
-        text += f"\n[output cut at {OUTPUT_CAP} of {len(raw)} bytes]"
+    timed_out, survivors = False, False
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    raw_path = out_path + ".raw"
+    # Output goes to a file, not a pipe: a process the check leaves behind cannot keep the read open, and every
+    # wait below has a bound (S5 review C12).
+    with open(raw_path, "wb") as raw_f:
+        try:
+            p = subprocess.Popen([exe] + list(argv[1:]), cwd=cwd, env=env, stdout=raw_f, stderr=subprocess.STDOUT,
+                                 stdin=subprocess.DEVNULL, **kw)
+        except OSError as e:
+            raw_f.write(f"could not start {argv[0]}: {e}".encode())
+            p, code = None, None
+        if p is not None:
+            job = _Job.attach(p)
+            try:
+                p.wait(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                timed_out = True
+                _kill_tree(p)
+            if job:
+                job.close()  # kills every process still in the job, including ones that detached
+            elif os.name != "nt":
+                try:  # what is left in the check's session; a process that started its own session escapes
+                    os.killpg(p.pid, signal.SIGKILL)
+                except OSError:
+                    pass
+            try:
+                p.wait(timeout=30)
+            except subprocess.TimeoutExpired:
+                survivors = True
+            code = p.returncode
+    duration = time.monotonic() - started
+    h = hashlib.sha256()
+    with open(raw_path, "rb") as f:
+        head = f.read(OUTPUT_CAP + 1)
+        h.update(head)
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+        size = f.tell()
+    os.remove(raw_path)
+    digest = h.hexdigest()
+    text = head[:OUTPUT_CAP].decode("utf-8", "replace")
+    if size > OUTPUT_CAP:
+        text += f"\n[output cut at {OUTPUT_CAP} of {size} bytes]"
+    if survivors:
+        text += "\n[the check's process did not exit after it was killed]"
     with open(out_path, "w", encoding="utf-8") as f:
         f.write(untrusted.redact(text, secrets))
     return {"exit_code": code, "timed_out": timed_out, "duration": round(duration, 3), "output_sha256": digest,
             "output_path": out_path, "executable": exe, "executable_sha256": exe_hash,
             "env_names": sorted({k: hashlib.sha256(v.encode()).hexdigest()[:12] for k, v in env.items()}.items())}
+
+
+class _Job:
+    """Windows: a Job Object holding a check and everything it starts; closing it kills them all, also processes
+    that detached from the check. (The check runs for a moment before it is assigned; a child started in that
+    moment is outside the job.)"""
+
+    def __init__(self, handle):
+        self.h = handle
+
+    @classmethod
+    def attach(cls, p):
+        if os.name != "nt":
+            return None
+        import ctypes
+        from ctypes import wintypes as wt
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        k32.CreateJobObjectW.restype = wt.HANDLE
+        k32.CreateJobObjectW.argtypes = [wt.LPVOID, wt.LPCWSTR]
+        k32.SetInformationJobObject.argtypes = [wt.HANDLE, ctypes.c_int, wt.LPVOID, wt.DWORD]
+        k32.AssignProcessToJobObject.argtypes = [wt.HANDLE, wt.HANDLE]
+        k32.CloseHandle.argtypes = [wt.HANDLE]
+
+        class Basic(ctypes.Structure):
+            _fields_ = [("PerProcessUserTimeLimit", ctypes.c_int64), ("PerJobUserTimeLimit", ctypes.c_int64),
+                        ("LimitFlags", wt.DWORD), ("MinimumWorkingSetSize", ctypes.c_size_t),
+                        ("MaximumWorkingSetSize", ctypes.c_size_t), ("ActiveProcessLimit", wt.DWORD),
+                        ("Affinity", ctypes.c_size_t), ("PriorityClass", wt.DWORD), ("SchedulingClass", wt.DWORD)]
+
+        class Extended(ctypes.Structure):
+            _fields_ = [("BasicLimitInformation", Basic), ("IoInfo", ctypes.c_uint64 * 6),
+                        ("ProcessMemoryLimit", ctypes.c_size_t), ("JobMemoryLimit", ctypes.c_size_t),
+                        ("PeakProcessMemoryUsed", ctypes.c_size_t), ("PeakJobMemoryUsed", ctypes.c_size_t)]
+
+        h = k32.CreateJobObjectW(None, None)
+        if not h:
+            return None
+        info = Extended()
+        info.BasicLimitInformation.LimitFlags = 0x2000  # JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+        ok = k32.SetInformationJobObject(h, 9, ctypes.byref(info), ctypes.sizeof(info)) and \
+            k32.AssignProcessToJobObject(h, int(p._handle))
+        if not ok:
+            k32.CloseHandle(h)
+            log.warning("could not put check process %s in a job object (%s)", p.pid, ctypes.get_last_error())
+            return None
+        job = cls(h)
+        job.k32 = k32
+        return job
+
+    def close(self):
+        if self.h:
+            self.k32.CloseHandle(self.h)
+            self.h = None
 
 
 def _kill_tree(p):
@@ -92,9 +170,10 @@ def file_hash(path):
         return "sha256:" + hashlib.file_digest(f, "sha256").hexdigest()
 
 
-def hash_depends(directory, paths):
+def hash_depends(directory, paths, repo_relative=False):
     """Record what each file a check depends on is now. Relative paths are inside the builder's repository
-    (git blob ids); absolute paths are outside it (held-out checks; sha256)."""
+    (git blob ids); absolute paths are outside it (held-out checks; sha256). Relative paths are taken from the
+    builder's directory, or from the repository's top with `repo_relative` (as recorded)."""
     out = {}
     top = prefix = None
     for p in paths:
@@ -105,7 +184,8 @@ def hash_depends(directory, paths):
             continue
         if top is None:
             top, prefix = snapshot.repo_root(directory)
-        rel = "/".join(x for x in [prefix] + p.replace("\\", "/").split("/") if x and x != ".")
+        rel = "/".join(x for x in ([] if repo_relative else [prefix]) + p.replace("\\", "/").split("/")
+                       if x and x != ".")
         h = snapshot.hash_file(top, rel)
         if h is None:
             raise VerifyError(f"{p} does not exist in {directory}")
@@ -256,6 +336,13 @@ class Verifier:
             results.append(entry)
         with self.d.store.tx() as conn:
             r2 = rounds.get(conn, rid)
+            # nothing is published from a quarantined journal, and results only cover the checks that ran
+            # (S5 review C15, C3)
+            if meta_get(conn, "quarantine"):
+                failed.append("Imperium is quarantined (journal integrity); results are not used")
+            ran = sorted((c["id"], c["version"]) for c in checks)
+            if ran != sorted((c["id"], c["version"]) for c in rounds.checks_for(conn, r["builder"], rid)):
+                failed.append("the checks changed while they were running; verify again")
             for type_, sev, data in events:
                 journal.append(conn, type_, sev, builder=r["builder"], data={"round": rid, "generation": gen, **data})
             if untrusted_checks:

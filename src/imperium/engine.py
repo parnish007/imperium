@@ -280,6 +280,12 @@ class Engine:
         with self.d.store.read() as conn:
             due = approvals.replies_due(conn, b["name"])
             qdue = approvals.question_replies_due(conn, b["name"])
+            braked = bool(meta_get(conn, "stop_all") or meta_get(conn, "quarantine"))
+        if braked:
+            # Under the brake only replies that stop work go out; a decided "once" or an answer waits for
+            # resume-all (S5 review C5).
+            due = [a for a in due if a["reply"] == "reject"]
+            qdue = [q for q in qdue if q["state"] == approvals.REJECTED]
         for a in due:
             try:
                 client.reply_permission(a["id"], a["reply"])
@@ -355,9 +361,18 @@ class Engine:
         with self.d.store.tx() as conn:
             if outbox.holder(conn, name):
                 return
+            # decided on this transaction, not on the read that began the cycle (S5 review C5)
+            if meta_get(conn, "stop_all") or meta_get(conn, "observe_only") or meta_get(conn, "quarantine"):
+                return
             m = outbox.next_queued(conn, name, owner_only=bool(b["paused"]))
             if m is None:
                 return
+            if m.get("round"):
+                rr = conn.execute("SELECT state FROM rounds WHERE id=?", (m["round"],)).fetchone()
+                if rr is not None and rr[0] in rounds.TERMINAL:  # never send into a decided round (S5 review C14)
+                    outbox.transition(conn, m["id"], outbox.CANCELLED, event="MSG_CANCELLED",
+                                      data={"note": f"round {m['round']} is {rr[0]}"})
+                    return
             oc_id = opencode.message_id()
             extra, gen = rounds.header_fields(conn, m)
             body = rounds.body_for(conn, m, gen)

@@ -98,6 +98,12 @@ def tree_of_worktree(top):
             if line:
                 meta, path = line.split(b"\t", 1)
                 modes[path.decode("utf-8", "surrogateescape")] = meta.split()[0].decode()
+        subs = sorted(p for p, m in modes.items() if m == "160000")
+        if subs:
+            # a submodule's own changes would be invisible to the snapshot and missing from a check's copy
+            # (S5 review C13): refuse rather than verify something else than what is there
+            raise SnapshotError(f"submodules are not supported (found {', '.join(subs[:3])}); verify the "
+                                "submodule's repository on its own")
         listed = _git(["ls-files", "-z", "--cached", "--others", "--exclude-standard"], top, env, raw=True)
         paths = sorted({p.decode("utf-8", "surrogateescape") for p in listed.split(b"\0") if p})
         remove, files, links = [], [], []
@@ -112,7 +118,7 @@ def tree_of_worktree(top):
             elif os.path.isfile(full):
                 files.append(p)
             elif os.path.isdir(full):
-                continue  # a submodule (gitlink): its index entry is kept as it is
+                continue  # an untracked nested repository: git lists it as one entry; its files are not ours
             elif p in modes:
                 remove.append(p)
         lines = []

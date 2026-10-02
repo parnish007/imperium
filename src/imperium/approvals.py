@@ -39,20 +39,21 @@ class Conflict(ApprovalError):
 
 def path_within(candidate, root, case_insensitive=None):
     """True if `candidate` names a location inside `root` (or root itself). Relative candidates are taken
-    relative to root. Aliases that could dodge the comparison are refused (False): UNC and device paths, 8.3 short
-    names, `~`. Existing paths are compared by their real location (symlinks resolved)."""
+    relative to root. Both are resolved first: symlinks in every existing part of the path (also a parent of a
+    file that does not exist yet) and, on Windows, 8.3 short names. Aliases that could dodge the comparison are
+    refused (False): UNC and device paths, `~`, and a short name left in a part that does not exist."""
     if not candidate or not root:
         return False
     c = str(candidate)
-    if c.startswith("\\\\") or c.startswith("//") or c.startswith("~") or SHORT_NAME.search(c):
+    if c.startswith("\\\\") or c.startswith("//") or c.startswith("~"):
         return False
     if not os.path.isabs(c):
         c = os.path.join(root, c)
-    c, r = os.path.normpath(os.path.abspath(c)), os.path.normpath(os.path.abspath(root))
-    if os.path.exists(c):
-        c = os.path.realpath(c)
-    if os.path.exists(r):
-        r = os.path.realpath(r)
+    # non-strict realpath resolves as far as the path exists and appends the rest (S5 review C7)
+    c = os.path.realpath(os.path.normpath(os.path.abspath(c)))
+    r = os.path.realpath(os.path.normpath(os.path.abspath(root)))
+    if SHORT_NAME.search(c):
+        return False
     if case_insensitive is None:
         case_insensitive = os.name == "nt"
     if case_insensitive:
@@ -108,11 +109,25 @@ def _rule_matches(rule, a, workspace):
     return all(hits) if rule["decision"] == "allow" else any(hits)
 
 
+MAX_PATTERNS, MAX_PATTERN_LEN = 50, 2000
+
+
+def maybe_cut(a):
+    """True if the stored patterns may be shorter than what the builder asked (they are capped when stored)."""
+    pats = a["patterns"] or []
+    return len(pats) >= MAX_PATTERNS or any(len(p) >= MAX_PATTERN_LEN for p in pats)
+
+
 def evaluate(conn, a, workspace):
-    """The rule that decides this ask, if any. Deny wins over allow."""
+    """The rule that decides this ask, if any. Deny wins over allow. An ask whose patterns may have been cut is
+    never allowed by a rule: what was cut could be what a deny rule would catch (S5 review C6)."""
     matched = [r for r in rules(conn) if _rule_matches(r, a, workspace)]
     deny = [r for r in matched if r["decision"] == "deny"]
-    return (deny or matched or [None])[0]
+    if deny:
+        return deny[0]
+    if maybe_cut(a):
+        return None
+    return (matched or [None])[0]
 
 
 # --- asks --------------------------------------------------------------------------------------------------
@@ -155,15 +170,28 @@ def list_(conn, builder=None, open_only=True, auto_only=False, since_seq=None, l
     return [_row(r) for r in conn.execute(q, args)]
 
 
+def auto_unreviewed(conn, after_seq, limit=200):
+    """Automatic answers not yet reviewed, oldest decision first (the report pages through them)."""
+    rows = conn.execute("SELECT * FROM approvals WHERE by_policy=1 AND decided_seq > ? ORDER BY decided_seq LIMIT ?",
+                        (after_seq, limit)).fetchall()
+    out = []
+    for r in rows:
+        a = _row(r)
+        a["decided_seq"] = r["decided_seq"]
+        out.append(a)
+    return out
+
+
 def observe_ask(conn, builder, ask, now):
     """OpenCode listed a new ask (from the reader, in the commit of PERMISSION_ASKED)."""
     if conn.execute("SELECT 1 FROM approvals WHERE id=?", (ask["id"],)).fetchone():
         return None
     conn.execute("INSERT INTO approvals(id, builder, permission, patterns, always, state, by_policy, reply_state, "
                  "created) VALUES(?,?,?,?,?,?,0,'none',?)",
-                 (ask["id"], builder, ask.get("permission"), json.dumps([str(p)[:2000] for p in ask.get("patterns")
-                                                                         or []][:50]),
-                  json.dumps([str(p)[:2000] for p in ask.get("always") or []][:50]), PENDING, now))
+                 (ask["id"], builder, ask.get("permission"),
+                  json.dumps([str(p)[:MAX_PATTERN_LEN] for p in ask.get("patterns") or []][:MAX_PATTERNS]),
+                  json.dumps([str(p)[:MAX_PATTERN_LEN] for p in ask.get("always") or []][:MAX_PATTERNS]), PENDING,
+                  now))
     return get(conn, ask["id"])
 
 

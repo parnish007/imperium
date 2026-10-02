@@ -271,18 +271,33 @@ def r_stop_all(d, principal, body, query):
 
 def r_approvals(d, principal, body, query):
     builder = query.get("builder", [None])[0]
-    auto = query.get("auto", ["0"])[0] == "1"
-    show_all = query.get("all", ["0"])[0] == "1" or auto
+    show_all = query.get("all", ["0"])[0] == "1"
     with d.store.read() as conn:
-        rows = approvals.list_(conn, builder, open_only=not show_all, auto_only=auto)
+        rows = approvals.list_(conn, builder, open_only=not show_all)
     return {"approvals": rows}
 
 
+def r_approvals_auto(d, principal, body, query):
+    """The report of automatic answers not yet reviewed, one page at a time, oldest first (S5 review C10)."""
+    after = query.get("after", [None])[0]
+    limit = max(1, min(int(query.get("limit", ["200"])[0] or 200), 500))
+    with d.store.read() as conn:
+        start = int(after) if after is not None else int(meta_get(conn, "auto_report_seq") or 0)
+        rows = approvals.auto_unreviewed(conn, start, limit)
+    return {"approvals": rows, "through": rows[-1]["decided_seq"] if rows else start, "more": len(rows) == limit}
+
+
 def r_approvals_report_seen(d, principal, body, query):
+    """Mark the report reviewed through the last automatic answer it showed, never beyond."""
+    through = body.get("through")
+    if not isinstance(through, int) or isinstance(through, bool) or through < 0:
+        raise HttpError(400, "through must be the `through` value of the report that was shown")
     with d.store.tx() as conn:
-        head_seq, _ = journal.head(conn)
-        meta_set(conn, "auto_report_seq", head_seq)
-    return {"seen_through": head_seq}
+        seen = int(meta_get(conn, "auto_report_seq") or 0)
+        top = conn.execute("SELECT COALESCE(MAX(decided_seq), 0) FROM approvals WHERE by_policy=1").fetchone()[0]
+        new = max(seen, min(through, top))
+        meta_set(conn, "auto_report_seq", new)
+    return {"seen_through": new}
 
 
 def r_approval(d, principal, body, query):
@@ -460,6 +475,7 @@ def r_round_verify(d, principal, body, query):
         if not r["base_commit"]:
             raise rounds.Conflict(f"round {rid} has no base snapshot (is the workspace a git repository?)")
         job = secrets.token_hex(6)
+        rounds.void_verification(conn, rid, d.engine.clock(), "verification requested again", principal)
         conn.execute("UPDATE rounds SET verify_job=? WHERE id=?", (job, rid))
         journal.append(conn, "VERIFY_REQUESTED", "INFO", builder=r["builder"], caller=principal,
                        data={"round": rid, "generation": r["generation"], "job": job})
@@ -488,15 +504,36 @@ def r_round_decide(d, principal, body, query):
     rid, decision = str(_req(body, "id")), str(_req(body, "decision"))
     with d.store.read() as conn:
         r = rounds.get(conn, rid)
-    tree = None
-    if decision == "accept" and r["cand_tree"]:
+    tree, override = None, bool(body.get("override"))
+    if not (decision == "accept" and r["cand_tree"]):
+        with d.store.tx() as conn:
+            r = rounds.decide(conn, rid, decision, principal, str(body.get("note") or ""), d.engine.clock(),
+                              override=override)
+        return {"round": _public_round(r)}
+    # Accept compares the workspace with the verified snapshot. Nothing may be sent to the builder from the
+    # comparison to the commit (its reservation is held), and the builder must be idle: a file system cannot be
+    # locked, so this is the narrowest window Imperium can give (S5 review C4). What is accepted is the verified
+    # commit, which does not change.
+    b_name, holder = r["builder"], f"accept:{rid}"
+    with d.store.tx() as conn:
+        cp_row = conn.execute("SELECT data FROM checkpoints WHERE builder=?", (b_name,)).fetchone()
+        cp = json.loads(cp_row[0]) if cp_row else {}
+        if (cp.get("status") != "idle" or cp.get("open")) and not override:
+            raise rounds.Conflict("cannot accept while the builder is working; accept when it is idle")
+        if outbox.holder(conn, b_name):
+            raise rounds.Conflict("a message is in flight to the builder; accept when it is done")
+        outbox.reserve(conn, b_name, holder, d.engine.clock())
+    try:
         try:
-            tree = _workspace_tree(d, r["builder"])
+            tree = _workspace_tree(d, b_name)
         except snapshot.SnapshotError as e:
             raise HttpError(409, f"cannot compare the workspace with the verified snapshot: {e}") from None
-    with d.store.tx() as conn:
-        r = rounds.decide(conn, rid, decision, principal, str(body.get("note") or ""), d.engine.clock(),
-                          workspace_tree=tree, override=bool(body.get("override")))
+        with d.store.tx() as conn:
+            r = rounds.decide(conn, rid, decision, principal, str(body.get("note") or ""), d.engine.clock(),
+                              workspace_tree=tree, override=override)
+    finally:
+        with d.store.tx() as conn:
+            outbox.release(conn, b_name, holder)
     return {"round": _public_round(r)}
 
 
@@ -564,14 +601,7 @@ def r_check_approve(d, principal, body, query):
         c = rounds.check_get(conn, cid)
         kind, ref = c["scope"].split(":", 1)
         directory = builders.get(conn, ref if kind == "builder" else rounds.get(conn, ref)["builder"])["directory"]
-    top, prefix = snapshot.repo_root(directory)
-    rel = []
-    for path in c["depends"]:
-        if os.path.isabs(path):
-            rel.append(path)
-        else:
-            rel.append(os.path.relpath(os.path.join(top, *path.split("/")), directory).replace("\\", "/"))
-    depends = verify.hash_depends(directory, rel)
+    depends = verify.hash_depends(directory, list(c["depends"]), repo_relative=True)
     with d.store.tx() as conn:
         n = rounds.define_check(conn, cid=cid, scope=c["scope"], argv=c["argv"], working_dir=c["working_dir"],
                                 env=c["env"], timeout=c["timeout"], must_fail_on_base=c["must_fail_on_base"],
@@ -645,13 +675,16 @@ def r_gate(d, principal, body, query):
 
 def r_journal(d, principal, body, query):
     """Read the journal without touching any feed (dashboard, export). Builder text only for the owner's export."""
+    # `after` given (0 included): ascending from it, for complete reads such as export; absent: the newest
+    # `limit` events, for the dashboard (S5 review C11)
+    ascending = "after" in query
     after = int(query.get("after", ["0"])[0] or 0)
     limit = max(1, min(int(query.get("limit", ["100"])[0] or 100), 1000))
     full = query.get("full", ["0"])[0] == "1"
     if full and principal != "owner":
         raise HttpError(403, "the full export is the owner's")
     with d.store.read() as conn:
-        if after:
+        if ascending:
             rows = conn.execute("SELECT * FROM events WHERE seq > ? ORDER BY seq LIMIT ?", (after, limit)).fetchall()
         else:
             rows = conn.execute("SELECT * FROM (SELECT * FROM events ORDER BY seq DESC LIMIT ?) ORDER BY seq",
@@ -856,6 +889,7 @@ ROUTES = {
     ("POST", "/v1/checks/retire"): (r_check_retire, "owner", True),
     ("GET", "/v1/checks"): (r_checks, "any", False),
     ("GET", "/v1/approvals"): (r_approvals, "any", False),
+    ("GET", "/v1/approvals/auto"): (r_approvals_auto, "owner", False),
     ("POST", "/v1/approvals/report-seen"): (r_approvals_report_seen, "owner", True),
     ("GET", "/v1/approval"): (r_approval, "any", False),
     ("POST", "/v1/approvals/decide"): (r_approval_decide, "any", True),
@@ -1213,26 +1247,27 @@ class Daemon:
             journal.append(conn, "QUARANTINED", "CRITICAL", data={"reason": "journal chain broken"})
 
     def _recover(self):
-        r = self.refresh_chain()
+        chain = self.refresh_chain()
         self.archives = retention.check_archives(self.store, paths.archive(self.home))
         with self.store.tx() as conn:
             tokens.finish_rotation(conn, self.home)
             outbox.recover(conn)
-            for r in conn.execute("SELECT id, builder, generation FROM rounds WHERE verify_job IS NOT NULL").fetchall():
-                journal.append(conn, "VERIFY_INTERRUPTED", "NOTICE", builder=r[1],
-                               data={"round": r[0], "generation": r[2], "note": "the daemon stopped; verify again"})
+            jobs = conn.execute("SELECT id, builder, generation FROM rounds WHERE verify_job IS NOT NULL").fetchall()
+            for job in jobs:
+                journal.append(conn, "VERIFY_INTERRUPTED", "NOTICE", builder=job[1],
+                               data={"round": job[0], "generation": job[2], "note": "the daemon stopped; verify again"})
             conn.execute("UPDATE rounds SET verify_job=NULL WHERE verify_job IS NOT NULL")
-            conn.execute("DELETE FROM reservations WHERE holder LIKE 'verify:%'")
-            if not r["ok"]:
+            conn.execute("DELETE FROM reservations WHERE holder LIKE 'verify:%' OR holder LIKE 'accept:%'")
+            if not chain["ok"]:
                 # An untrustworthy journal stops everything that acts; reading stays possible [C6].
                 journal.append(conn, "INTEGRITY_FAIL", "CRITICAL",
-                               data={"first_bad": r["first_bad"], "reason": r["reason"]})
-                meta_set(conn, "quarantine", f"journal chain broken at event {r['first_bad']}: {r['reason']}")
+                               data={"first_bad": chain["first_bad"], "reason": chain["reason"]})
+                meta_set(conn, "quarantine", f"journal chain broken at event {chain['first_bad']}: {chain['reason']}")
                 journal.append(conn, "QUARANTINED", "CRITICAL", data={"reason": "journal chain broken"})
             journal.append(conn, "DAEMON_STARTED", "INFO",
                            data={"run_id": self.run_id, "pid": self.pid, "version": __version__})
             journal.append(conn, "RECOVERED", "INFO",
-                           data={"chain_ok": r["ok"], "archives_removed": len(self.archives["removed"]),
+                           data={"chain_ok": chain["ok"], "archives_removed": len(self.archives["removed"]),
                                  "archives_missing": len(self.archives["missing"]),
                                  "archives_mismatched": len(self.archives["mismatched"]),
                                  "observe_only": meta_get(conn, "observe_only")})

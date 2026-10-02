@@ -369,6 +369,26 @@ def _maybe_verified(conn, rid, now):
     return ok
 
 
+def void_verification(conn, rid, now, reason, caller=None):
+    """The check evidence of a round no longer stands (a new candidate is being verified, or the checks that
+    apply changed): forget it, and leave VERIFIED (S5 review C1, C3)."""
+    r = get(conn, rid)
+    if r["state"] in TERMINAL:
+        return
+    conn.execute("UPDATE rounds SET checks_ok_generation=NULL WHERE id=?", (rid,))
+    if r["state"] == VERIFIED:
+        _set(conn, rid, now, state=READY)
+        _event(conn, r, "VERIFICATION_VOIDED", "ACTION", {"reason": reason}, caller=caller)
+
+
+def void_for_scope(conn, scope, now, reason, caller=None):
+    kind, ref = scope.split(":", 1)
+    col = "builder" if kind == "builder" else "id"
+    for row in conn.execute(f"SELECT id FROM rounds WHERE {col}=? AND state NOT IN (?,?,?)",
+                            (ref, *TERMINAL)).fetchall():
+        void_verification(conn, row[0], now, reason, caller)
+
+
 def decide(conn, rid, decision, principal, note, now, workspace_tree=None, override=False):
     """accept | reject | abandon. The first committed decision wins. Accept needs VERIFIED and an unchanged
     workspace, unless the owner overrides (journaled as such)."""
@@ -384,6 +404,10 @@ def decide(conn, rid, decision, principal, note, now, workspace_tree=None, overr
         problems = []
         if r["state"] != VERIFIED:
             problems.append(f"the round is {r['state']}, not VERIFIED")
+        elif r["checks_ok_generation"] != r["generation"] or r["cand_generation"] != r["generation"]:
+            problems.append("the checks have not passed on this generation's snapshot")
+        if r["verify_job"]:
+            problems.append("a verification is running; wait for its result")
         if r["cand_tree"] and workspace_tree is not None and workspace_tree != r["cand_tree"]:
             problems.append("the workspace changed since the verified snapshot; verify again")
         if problems and not override:
@@ -395,10 +419,9 @@ def decide(conn, rid, decision, principal, note, now, workspace_tree=None, overr
         to = REJECTED if decision == "reject" else ABANDONED
     _set(conn, rid, now, state=to, decided_by=principal, decision_note=(note or "")[:MAX_TEXT],
          override=1 if data.get("override") else 0)
-    for m in outbox.list_(conn, r["builder"], [outbox.QUEUED]):
-        if m.get("round") == rid:
-            outbox.transition(conn, m["id"], outbox.CANCELLED, event="MSG_CANCELLED", caller=principal,
-                              decided_by=principal, data={"note": f"round {rid} is {to}"})
+    for (mid,) in conn.execute("SELECT id FROM outbox WHERE round=? AND state=?", (rid, outbox.QUEUED)).fetchall():
+        outbox.transition(conn, mid, outbox.CANCELLED, event="MSG_CANCELLED", caller=principal,
+                          decided_by=principal, data={"note": f"round {rid} is {to}"})
     _event(conn, r, f"ROUND_{to}", "ACTION" if to == ACCEPTED else "NOTICE", data, caller=principal)
     return get(conn, rid)
 
@@ -470,6 +493,8 @@ def define_check(conn, *, cid, scope, argv, working_dir, env, timeout, must_fail
                    data={"check": cid, "version": version, "scope": scope, "argv": argv, "working_dir": wd,
                          "env": sorted(set(env)), "must_fail_on_base": bool(must_fail_on_base),
                          "depends": depends, "required": bool(required)})
+    # results from before this check existed do not cover it
+    void_for_scope(conn, scope, journal.now(), f"check {cid} v{version} was defined; verify again", principal)
     return check_get(conn, cid)
 
 

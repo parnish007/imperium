@@ -28,7 +28,7 @@ jobs:
         working-directory: tests
         shell: bash
         env:
-          PYTHONPATH: ../src
+          PYTHONPATH: ${{ github.workspace }}/src
         run: |
           set -o pipefail
           python -m unittest discover -s . -p "test_*.py" -v 2>&1 | tee ../test-output.txt

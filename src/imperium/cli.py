@@ -387,13 +387,17 @@ def cmd_up(ctx):
     # launcher that starts the real interpreter as a child process with another pid.
     run_id = secrets.token_hex(8)
     cmd = [sys.executable, "-m", "imperium.daemon", "--home", ctx["home"], "--run-id", run_id]
-    kw = {"stdin": subprocess.DEVNULL, "stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL,
-          "close_fds": True}
+    err_path = os.path.join(paths.logs(ctx["home"]), "imperiumd.stderr")
+    err_f = open(err_path, "ab")  # what the daemon prints before its own log is set up (an import error, ...)
+    kw = {"stdin": subprocess.DEVNULL, "stdout": subprocess.DEVNULL, "stderr": err_f, "close_fds": True}
     if os.name == "nt":
         kw["creationflags"] = 0x00000008 | 0x00000200  # DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
     else:
         kw["start_new_session"] = True
-    proc = subprocess.Popen(cmd, **kw)
+    try:
+        proc = subprocess.Popen(cmd, **kw)
+    finally:
+        err_f.close()
     deadline = time.monotonic() + 15
     while time.monotonic() < deadline:
         h = c.health()
@@ -405,9 +409,22 @@ def cmd_up(ctx):
                 h = c.health()
                 if h:
                     return {"run_id": h["run_id"], "pid": h["pid"], "already_running": True}
-            raise Fail(ERROR, f"the daemon exited with code {rc}; see {paths.logs(ctx['home'])}")
+            raise Fail(ERROR, f"the daemon exited with code {rc}" + _log_tail(ctx["home"]))
         time.sleep(0.1)
-    raise Fail(ERROR, f"the daemon did not answer within 15 s; see {paths.logs(ctx['home'])}")
+    raise Fail(ERROR, "the daemon did not answer within 15 s" + _log_tail(ctx["home"]))
+
+
+def _log_tail(home, n=6):
+    out = []
+    for name in ("imperiumd.stderr", "imperiumd.log"):
+        try:
+            with open(os.path.join(paths.logs(home), name), encoding="utf-8", errors="replace") as f:
+                lines = [x.rstrip() for x in f.readlines()[-n:] if x.strip()]
+        except OSError:
+            continue
+        if lines:
+            out.append(f"{name}: " + " | ".join(lines))
+    return f"; see {paths.logs(home)}" + ("; " + "; ".join(out) if out else "")
 
 
 def cmd_down(ctx):
@@ -699,11 +716,21 @@ def cmd_approvals(ctx):
     if a.all:
         q["all"] = "1"
     if a.auto:
+        # every unreviewed automatic answer, oldest first; marked reviewed only through the last one shown, and
+        # only when nothing was filtered out (S5 review C10)
         c = _owner_or_refuse(ctx)
-        q["auto"] = "1"
-        r = c.call("GET", "/v1/approvals?" + urllib.parse.urlencode(q))
-        c.call("POST", "/v1/approvals/report-seen", {})
-        return r
+        rows, after = [], None
+        while True:
+            page = c.call("GET", "/v1/approvals/auto" + ("" if after is None else f"?after={after}"))
+            rows += page["approvals"]
+            after = page["through"]
+            if not page["more"]:
+                break
+        if a.builder:
+            return {"approvals": [x for x in rows if x["builder"] == a.builder], "marked_reviewed": False,
+                    "note": "filtered by builder: nothing was marked reviewed"}
+        seen = c.call("POST", "/v1/approvals/report-seen", {"through": after})
+        return {"approvals": rows, "marked_reviewed": True, "seen_through": seen["seen_through"]}
     return _client(ctx).call("GET", "/v1/approvals" + ("?" + urllib.parse.urlencode(q) if q else ""))
 
 
