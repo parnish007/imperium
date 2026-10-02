@@ -47,6 +47,11 @@ fixed the code, ran the test, and reported through Imperium's MCP tool; verifica
 failed on the base snapshot (the check discriminates); objective recorded; accepted. 50 seconds from opening to
 acceptance. OpenCode kept the message id Imperium chose. This is one run, not a rate.
 
+The same round through the Agent Client Protocol adapter: Imperium started `opencode acp --pure` itself (with its
+own data and config folders), opened a session with the builder's tool, and sent the brief; the agent fixed the
+code and reported through the tool; checks passed on the candidate and failed on the base; accepted 30 seconds
+after opening. Stopping Imperium stopped the agent. One run.
+
 ## The test suite
 
 Unit, integration and fault tests, including mutation checks: for each guarantee a deliberate bug was put back

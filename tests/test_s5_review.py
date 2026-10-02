@@ -306,7 +306,8 @@ class TestGitInput(unittest.TestCase):
     def test_d1_a_line_break_in_a_name_cannot_add_index_entries(self):
         ws = self.repo()
         blob = git(ws, "hash-object", "-w", "a.txt")
-        with open(os.path.join(ws, f"evil\n100644 {blob}\t.imperium/pwn"), "w") as f:
+        # a name cannot hold "/", but it can name another top-level entry: here one the builder never wrote
+        with open(os.path.join(ws, f"evil\n100644 {blob}\tinjected.txt"), "w") as f:
             f.write("x")
         with self.assertRaises(snapshot.SnapshotError):
             snapshot.take(ws, "refs/imperium/t/nl")
