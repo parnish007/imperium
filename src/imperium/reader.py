@@ -20,6 +20,7 @@ KNOWN_PARTS = {"text", "subtask", "reasoning", "file", "tool", "step-start", "st
                "agent", "retry", "compaction"}
 KNOWN_STATUS = {"idle", "busy", "retry"}
 RECENT_TEXTS = 50
+MAX_DEPTH = 8  # sub-agent nesting followed when deciding whether a busy session belongs to this builder
 
 
 def _key(info):
@@ -102,7 +103,8 @@ class Reader:
         cp.update({"attached": True, "version": self.version, "last_key": _key(last["info"]) if last else None,
                    "last_id": last["info"]["id"] if last else None, "phase": None, "scan": [], "open": {},
                    "pending": [], "status": st.get("type"), "retry_attempt": st.get("attempt"), "permissions": [],
-                   "perm_last": [], "perm_broken": False, "questions": [], "unknown": [], "texts": []})
+                   "perm_last": [], "perm_broken": False, "questions": [], "unknown": [], "texts": [],
+                   "busy_children": None})
         if last and last["info"].get("role") == "assistant" and not last["info"].get("time", {}).get("completed"):
             cp["open"][last["info"]["id"]] = {"role": "assistant"}
         out.append(self._obs("BUILDER_ATTACHED", "INFO", {"session_id": self.sid, "directory": self.directory,
@@ -115,7 +117,9 @@ class Reader:
 
     # --- status, permissions, questions --------------------------------------------------------------
     def _status(self, cp, out):
-        st = self.c.status_map().get(self.sid) or {"type": "idle"}
+        smap = self.c.status_map()
+        self._children(cp, out, smap)
+        st = smap.get(self.sid) or {"type": "idle"}
         t = st.get("type")
         if t not in KNOWN_STATUS:
             self._unknown(cp, out, "status type", t)
@@ -129,6 +133,33 @@ class Reader:
             out.append(self._obs("BUILDER_RETRY", "NOTICE", {"attempt": st.get("attempt"), "next": st.get("next")},
                                  text={"message": st.get("message")}))
         cp["status"], cp["retry_attempt"] = t, st.get("attempt")
+
+    def _children(self, cp, out, smap):
+        """Busy sessions descended from the builder's (sub-agents it started). A builder whose sub-agent is still
+        working is not idle, even when its own session says so."""
+        busy = []
+        for sid, st in smap.items():
+            if sid == self.sid or (st or {}).get("type") == "idle":
+                continue
+            cur, depth = sid, 0
+            while cur and depth < MAX_DEPTH:
+                try:
+                    parent = self.c.session(cur).get("parentID")
+                except opencode.OCError as e:
+                    if e.status != 404:
+                        raise
+                    parent = None  # another project's session
+                if parent == self.sid:
+                    busy.append(sid)
+                    break
+                cur, depth = parent, depth + 1
+        busy.sort()
+        before = cp.get("busy_children") or []
+        if busy and not before:
+            out.append(self._obs("SUBAGENT_BUSY", "INFO", {"sessions": busy}))
+        elif before and not busy:
+            out.append(self._obs("SUBAGENT_IDLE", "INFO", {"sessions": before}))
+        cp["busy_children"] = busy
 
     def _permissions(self, cp, out):
         try:

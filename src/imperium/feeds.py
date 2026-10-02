@@ -35,9 +35,10 @@ def create(conn, name, *, principal, floor):
 
 
 def reassign(conn, name, principal):
-    """Give a feed to a new principal (the director role changing sessions); its bookmark is kept."""
+    """Give a feed to a new principal (the director role changing sessions). Acknowledgements are the role's and
+    are kept; what was only shown to the previous session must be shown again before the new one can ack it."""
     get(conn, name)
-    conn.execute("UPDATE consumers SET principal=? WHERE name=?", (principal, name))
+    conn.execute("UPDATE consumers SET principal=?, shown_through=acked_seq WHERE name=?", (principal, name))
 
 
 def get(conn, name):

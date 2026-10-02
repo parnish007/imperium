@@ -14,7 +14,7 @@ import threading
 import time
 import urllib.parse
 
-from . import __version__, audit, backup, builders, config, feeds, journal, opencode, paths, retention, tokens
+from . import __version__, audit, backup, builders, config, feeds, journal, opencode, outbox, paths, retention, tokens
 from .engine import Engine
 from . import fsutil
 from .store import Store, StoreFailed, meta_get, meta_set
@@ -114,16 +114,22 @@ def r_status(d, principal, body, query):
         observe_only = meta_get(conn, "observe_only")
         dropped = audit.dropped(conn)
         bl = []
+        stop_all = meta_get(conn, "stop_all")
         for b in builders.list_(conn):
             r = conn.execute("SELECT data FROM checkpoints WHERE builder=?", (b["name"],)).fetchone()
             cp = json.loads(r[0]) if r else {}
+            queued = conn.execute("SELECT COUNT(*) FROM outbox WHERE builder=? AND state='QUEUED'",
+                                  (b["name"],)).fetchone()[0]
             bl.append({"name": b["name"], "endpoint": b["endpoint"], "session_id": b["session_id"],
-                       "opencode_version": b["opencode_version"], "status": cp.get("status"),
+                       "opencode_version": b["opencode_version"], "allowed_version": b["allowed_version"],
+                       "paused": bool(b["paused"]), "status": cp.get("status"),
                        "permissions_pending": cp.get("permissions"), "questions_pending": cp.get("questions"),
+                       "busy_subagents": cp.get("busy_children"), "queued": queued,
+                       "in_flight": outbox.holder(conn, b["name"]),
                        **(d.engine.state(b["name"]) if d.engine else {})})
     return {"run_id": d.run_id, "pid": d.pid, "port": d.port, "started": d.started, "version": __version__,
             "principal": principal, "head_seq": head_seq, "chain": d.chain, "archives": d.archives,
-            "observe_only": observe_only, "quarantine": d.quarantine(), "consumers": consumers,
+            "observe_only": observe_only, "stop_all": stop_all, "quarantine": d.quarantine(), "consumers": consumers,
             "needs_you": needs_you, "audit_dropped": dropped, "builders": bl}
 
 
@@ -177,6 +183,97 @@ def r_builder_remove(d, principal, body, query):
 
 def _active_director(conn):
     return conn.execute("SELECT * FROM directors WHERE released_at IS NULL ORDER BY id DESC LIMIT 1").fetchone()
+
+
+def r_builder_pause(d, principal, body, query):
+    with d.store.tx() as conn:
+        return {"builder": builders.set_paused(conn, str(_req(body, "name")), True, principal)}
+
+
+def r_builder_resume(d, principal, body, query):
+    with d.store.tx() as conn:
+        return {"builder": builders.set_paused(conn, str(_req(body, "name")), False, principal)}
+
+
+def r_builder_allow_version(d, principal, body, query):
+    with d.store.tx() as conn:
+        return {"builder": builders.allow_version(conn, str(_req(body, "name")), _req(body, "version"), principal)}
+
+
+def r_stop_all(d, principal, body, query):
+    """Nothing is sent to any builder until the owner resumes. Anyone may stop; only the owner resumes."""
+    reason = str(body.get("reason") or "stopped").strip()[:200]
+    with d.store.tx() as conn:
+        meta_set(conn, "stop_all", f"{reason} (by {principal})")
+        journal.append(conn, "STOP_ALL", "ACTION", caller=principal,
+                       data={"reason": reason, "effect": "no message is sent to any builder until `imperium resume-all`"})
+    return {"stopped": True}
+
+
+def r_resume_all(d, principal, body, query):
+    with d.store.tx() as conn:
+        if not meta_get(conn, "stop_all"):
+            raise feeds.Refused("not stopped")
+        meta_set(conn, "stop_all", None)
+        journal.append(conn, "RESUME_ALL", "NOTICE", caller=principal)
+    return {"stopped": False}
+
+
+def r_send(d, principal, body, query):
+    name, text = str(_req(body, "builder")), _req(body, "body")
+    if not isinstance(text, str) or not text.strip():
+        raise HttpError(400, "body must be non-empty text")
+    key = str(_req(body, "client_key")).strip()
+    if not key or len(key) > 128:
+        raise HttpError(400, "client_key must be 1-128 characters")
+    with d.store.tx() as conn:
+        builders.get(conn, name)
+        m = outbox.enqueue(conn, builder=name, body=text, client_key=key, principal=principal,
+                           now=d.engine.clock())
+    return {"message": _public(m)}
+
+
+def _public(m):
+    out = dict(m)
+    out["body_bytes"] = len(out.pop("body").encode("utf-8"))
+    return out
+
+
+def r_message(d, principal, body, query):
+    mid = query.get("id", [None])[0]
+    if not mid:
+        raise HttpError(400, "id is required")
+    with d.store.read() as conn:
+        m = outbox.get(conn, mid)
+    if query.get("body", ["0"])[0] == "1":
+        return {"message": m}
+    return {"message": _public(m)}
+
+
+def r_queue(d, principal, body, query):
+    name = query.get("builder", [None])[0]
+    show_all = query.get("all", ["0"])[0] == "1"
+    states = None if show_all else [outbox.QUEUED, *outbox.IN_FLIGHT]
+    with d.store.read() as conn:
+        if name:
+            builders.get(conn, name)
+        return {"messages": [_public(m) for m in outbox.list_(conn, name, states)]}
+
+
+def r_cancel(d, principal, body, query):
+    with d.store.tx() as conn:
+        r = outbox.resolve(conn, str(_req(body, "id")), "cancel", principal)
+    return {"message": _public(r["message"])}
+
+
+def r_resolve(d, principal, body, query):
+    with d.store.tx() as conn:
+        r = outbox.resolve(conn, str(_req(body, "id")), str(_req(body, "choice")), principal,
+                           confirm_may_run_twice=bool(body.get("confirm_may_run_twice")), now=d.engine.clock())
+    out = {"message": _public(r["message"])}
+    if "resent_as" in r:
+        out["resent_as"] = r["resent_as"]
+    return out
 
 
 def r_director_show(d, principal, body, query):
@@ -337,6 +434,16 @@ ROUTES = {
     ("GET", "/v1/builders"): (r_builders, "any", False),
     ("POST", "/v1/builders"): (r_builder_add, "owner", True),
     ("POST", "/v1/builders/remove"): (r_builder_remove, "owner", True),
+    ("POST", "/v1/builders/pause"): (r_builder_pause, "owner", True),
+    ("POST", "/v1/builders/resume"): (r_builder_resume, "owner", True),
+    ("POST", "/v1/builders/allow-version"): (r_builder_allow_version, "owner", True),
+    ("POST", "/v1/stop-all"): (r_stop_all, "any", True),
+    ("POST", "/v1/resume-all"): (r_resume_all, "owner", True),
+    ("POST", "/v1/send"): (r_send, "any", True),
+    ("GET", "/v1/message"): (r_message, "any", False),
+    ("GET", "/v1/queue"): (r_queue, "any", False),
+    ("POST", "/v1/cancel"): (r_cancel, "any", True),
+    ("POST", "/v1/message/resolve"): (r_resolve, "any", True),
     ("POST", "/v1/events_since"): (r_events_since, "any", True),
     ("POST", "/v1/ack"): (r_ack, "any", True),
     ("GET", "/v1/show"): (r_show, "any", False),
@@ -352,7 +459,7 @@ ROUTES = {
 # State changes still allowed while quarantined: reading feeds (which records what was shown), backups,
 # stopping, and the owner's release. Everything that dispatches, decides or changes trust waits [C6].
 QUARANTINE_OK = {"/v1/events_since", "/v1/ack", "/v1/consumers", "/v1/backup", "/v1/quarantine/release",
-                 "/v1/shutdown"}
+                 "/v1/shutdown", "/v1/stop-all", "/v1/cancel"}
 
 
 def _req(body, key):
@@ -459,7 +566,7 @@ class _Handler(http.server.BaseHTTPRequestHandler):
             out = fn(d, principal, body, urllib.parse.parse_qs(url.query))
         except feeds.NotYours as e:
             raise HttpError(403, str(e)) from None
-        except builders.Conflict as e:
+        except (builders.Conflict, outbox.Conflict) as e:
             raise HttpError(409, str(e)) from None
         except (feeds.Refused, retention.PruneRefused) as e:
             raise HttpError(409, str(e)) from None
@@ -562,6 +669,7 @@ class Daemon:
         self.archives = retention.check_archives(self.store, paths.archive(self.home))
         with self.store.tx() as conn:
             tokens.finish_rotation(conn, self.home)
+            outbox.recover(conn)
             if not r["ok"]:
                 # An untrustworthy journal stops everything that acts; reading stays possible [C6].
                 journal.append(conn, "INTEGRITY_FAIL", "CRITICAL",

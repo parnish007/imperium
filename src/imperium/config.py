@@ -19,6 +19,15 @@ SCHEMA = {
         "unreachable_after": (int, 3),  # failed polls before BUILDER_UNREACHABLE
         "partless_polls": (int, 3),  # polls to wait for a user message's parts
     },
+    "delivery": {
+        "idle_stable_polls": (int, 2),  # consecutive idle polls before a builder may receive a message
+        "reconcile_window": (float, 60.0),  # seconds to find a sent message before it is UNCERTAIN
+        "admit_timeout": (float, 300.0),  # seconds a delivered message may wait unrun on an idle builder
+        "stall_alert": (float, 600.0),  # seconds messages may wait on a blocked builder before an ACTION event
+    },
+    "integrity": {
+        "verify_interval": (float, 300.0),  # seconds between journal chain checks while running
+    },
     "redaction": {
         "env_names": (list, []),  # environment variables whose values are redacted from builder text
     },
@@ -47,6 +56,20 @@ max_scan_pages = 20
 unreachable_after = 3
 # Polls to wait for a user message whose content is not yet stored.
 partless_polls = 3
+
+[delivery]
+# Consecutive idle polls before a builder may receive a message.
+idle_stable_polls = 2
+# Seconds to find a sent message in the builder's history before it is UNCERTAIN (never resent automatically).
+reconcile_window = 60.0
+# Seconds a delivered message may wait without running on an idle builder before it is STRANDED.
+admit_timeout = 300.0
+# Seconds messages may wait on a blocked builder before Imperium raises an ACTION event saying why.
+stall_alert = 600.0
+
+[integrity]
+# Seconds between journal chain checks while running (a break quarantines Imperium).
+verify_interval = 300.0
 
 [redaction]
 # Environment variables whose values are removed from builder text (values are never stored).

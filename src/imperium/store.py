@@ -97,11 +97,46 @@ SCHEMA = [
         released_at TEXT
     );
     """,
+    # version 4: the outbox and the one-holder-per-builder reservation (stage 3)
+    """
+    CREATE TABLE outbox(
+        id TEXT PRIMARY KEY,
+        builder TEXT NOT NULL,
+        client_key TEXT NOT NULL,
+        source TEXT NOT NULL,
+        principal TEXT NOT NULL,
+        kind TEXT NOT NULL,
+        body TEXT NOT NULL,
+        body_hash TEXT NOT NULL,
+        state TEXT NOT NULL,
+        oc_message_id TEXT,
+        supersedes TEXT,
+        created REAL NOT NULL,
+        dispatched_at REAL,
+        delivered_at REAL,
+        admitted_at REAL,
+        late_admitted_at REAL,
+        decided_by TEXT,
+        note TEXT,
+        UNIQUE(builder, client_key)
+    );
+    CREATE INDEX outbox_state ON outbox(builder, state);
+    CREATE UNIQUE INDEX outbox_oc ON outbox(builder, oc_message_id) WHERE oc_message_id IS NOT NULL;
+    CREATE TABLE reservations(
+        builder TEXT PRIMARY KEY,
+        holder TEXT NOT NULL,
+        since REAL NOT NULL
+    );
+    """,
 ]
 
 
 class StoreFailed(RuntimeError):
     """The store refused a write because an earlier write failed; the daemon is failing closed."""
+
+
+class StoreBusy(StoreFailed):
+    """The write lock could not be taken; nothing was written, so the store stays usable."""
 
 
 class Store:
@@ -152,6 +187,13 @@ class Store:
                 raise StoreFailed(self.failed)
             try:
                 self.conn.execute("BEGIN IMMEDIATE")
+            except sqlite3.OperationalError as e:
+                if "locked" in str(e) or "busy" in str(e):
+                    # Another process holds the write lock past busy_timeout. Nothing was written: refuse this
+                    # one write without failing the store closed [S4 review].
+                    raise StoreBusy(f"database is locked by another process: {e}") from e
+                self.failed = f"journal write failed: {e}"
+                raise StoreFailed(self.failed) from e
             except sqlite3.Error as e:
                 self.failed = f"journal write failed: {e}"
                 raise StoreFailed(self.failed) from e

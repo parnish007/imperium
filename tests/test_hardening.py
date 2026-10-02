@@ -335,3 +335,125 @@ class TestCodexS4Findings(unittest.TestCase):
         finally:
             h.cleanup()
             fake.close()
+
+
+class TestS4Review(StoreBase):
+    """Findings from the S4 cross-family review (DeepSeek V4.1 Flash, Muse Spark 1.3), verified in code."""
+
+    def tamper(self, seq):
+        with self.store.tx() as c:
+            c.execute("UPDATE events SET data='{\"tampered\":1}' WHERE seq=?", (seq,))
+
+    def accept(self):
+        """What `quarantine release` records: an anchor at the head with the first bad event."""
+        with self.store.tx() as c:
+            v = journal.verify_chain(c)
+            head_seq, head_hash = journal.head(c)
+            c.execute("INSERT INTO anchors(seq, hash, first_bad, reason, ts) VALUES(?,?,?,?,?)",
+                      (head_seq, head_hash, v.first_bad, "test", journal.now()))
+        return v
+
+    def verify(self):
+        with self.store.read() as c:
+            return journal.verify_chain(c)
+
+    def test_boundary_at_head_is_not_a_break(self):
+        for _ in range(3):
+            self.append()
+        with self.store.tx() as c:
+            head_seq, head_hash = journal.head(c)
+            c.execute("INSERT INTO prune_log(boundary_seq, boundary_hash, archive, archive_sha256, ts) "
+                      "VALUES(?,?,?,?,?)", (head_seq, head_hash, "a.jsonl", "0" * 64, journal.now()))
+            c.execute("DELETE FROM events")
+        self.assertTrue(self.verify().ok)
+
+    def test_accepting_a_break_does_not_hide_an_older_edit(self):
+        for _ in range(10):
+            self.append()
+        self.tamper(7)
+        v = self.accept()
+        self.assertEqual(v.first_bad, 7)
+        self.append()
+        self.assertTrue(self.verify().ok)
+        self.tamper(3)  # before the accepted region: must be caught
+        r = self.verify()
+        self.assertFalse(r.ok)
+        self.assertEqual(r.first_bad, 3)
+
+    def test_accepting_a_break_does_not_hide_a_later_edit(self):
+        for _ in range(10):
+            self.append()
+        self.tamper(4)
+        self.accept()
+        for _ in range(3):
+            self.append()
+        self.tamper(12)
+        r = self.verify()
+        self.assertFalse(r.ok)
+        self.assertEqual(r.first_bad, 12)
+
+    def test_accepted_missing_tail_then_new_events_verify(self):
+        for _ in range(10):
+            self.append()
+        with self.store.tx() as c:
+            c.execute("DELETE FROM events WHERE seq > 8")
+        self.assertEqual(self.accept().first_bad, 9)
+        self.append()
+        self.assertTrue(self.verify().ok)
+
+    def test_edit_right_after_the_anchor_is_reported_not_looped(self):
+        for _ in range(5):
+            self.append()
+        self.tamper(2)
+        self.accept()  # region [2, 6]
+        self.append()  # seq 6 links to the anchor
+        self.tamper(6)
+        r = self.verify()
+        self.assertFalse(r.ok)
+        self.assertEqual(r.first_bad, 6)
+
+    def test_pre_v3_key_is_compared_before_binding(self):
+        seq = self.append(source_key="k", data={"a": 1})
+        with self.store.tx() as c:
+            c.execute("UPDATE source_keys SET digest='pre-v3' WHERE key='k'")
+        with self.assertRaises(journal.SourceKeyConflict):
+            with self.store.tx() as c:
+                journal.append(c, "X", "ACTION", source_key="k", data={"a": 2})
+        self.assertEqual(self.append(source_key="k", data={"a": 1}), seq)
+
+    def test_reassigned_feed_must_show_again_before_ack(self):
+        for _ in range(3):
+            self.append()
+        with self.store.tx() as c:
+            feeds.create(c, "director", principal="director:a", floor="INFO")
+            page = feeds.events_since(c, "director", "director:a")
+            self.assertEqual(page["high_water"], 3)
+            feeds.reassign(c, "director", "director:b")
+        with self.assertRaises(feeds.Refused):
+            with self.store.tx() as c:
+                feeds.ack(c, "director", "director:b", 3)
+
+    def test_lock_timeout_refuses_one_write_without_failing_closed(self):
+        from imperium.store import StoreBusy
+        other = sqlite3.connect(os.path.join(self.home, "imperium.db"), isolation_level=None)
+        self.store.conn.execute("PRAGMA busy_timeout=50")
+        try:
+            other.execute("BEGIN IMMEDIATE")
+            with self.assertRaises(StoreBusy):
+                with self.store.tx():
+                    pass
+            self.assertIsNone(self.store.failed)
+        finally:
+            other.execute("ROLLBACK")
+            other.close()
+        self.append()  # still usable
+
+
+class TestS4ReviewDaemon(DaemonBase):
+    def test_periodic_verification_quarantines_a_running_daemon(self):
+        with self.h.d.store.tx() as conn:
+            conn.execute("UPDATE events SET data='{\"x\":1}' WHERE seq=1")
+        self.h.d.engine.verified_at = -1e9
+        self.h.d.engine.run_once()
+        self.assertTrue(self.c.call("GET", "/v1/status")["quarantine"])
+

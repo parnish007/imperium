@@ -76,9 +76,34 @@ def add(conn, *, name, endpoint, session_id, directory, password_env=None, passw
 
 def remove(conn, name, caller="owner"):
     get(conn, name)
+    live = conn.execute("SELECT COUNT(*) FROM outbox WHERE builder=? AND state NOT IN "
+                        "('ADMITTED','REJECTED','CANCELLED','SUPERSEDED')", (name,)).fetchone()[0]
+    if live:
+        raise Conflict(f"builder {name!r} has {live} message(s) queued or in flight; cancel or settle them first "
+                       "(`imperium queue {name}`)")
     conn.execute("DELETE FROM builders WHERE name=?", (name,))
     conn.execute("DELETE FROM checkpoints WHERE builder=?", (name,))
     journal.append(conn, "BUILDER_REMOVED", "NOTICE", builder=name, caller=caller)
+
+
+def set_paused(conn, name, paused, caller):
+    get(conn, name)
+    conn.execute("UPDATE builders SET paused=? WHERE name=?", (1 if paused else 0, name))
+    journal.append(conn, "BUILDER_PAUSED" if paused else "BUILDER_RESUMED", "NOTICE", builder=name, caller=caller,
+                   data={"effect": "only the owner's messages are sent" if paused else "all messages are sent"})
+    return get(conn, name)
+
+
+def allow_version(conn, name, version, caller):
+    """The owner accepts an OpenCode version outside the tested set for this builder (dispatch was blocked)."""
+    get(conn, name)
+    version = str(version).strip()
+    if not version:
+        raise BuilderError("a version is required")
+    conn.execute("UPDATE builders SET allowed_version=? WHERE name=?", (version, name))
+    journal.append(conn, "VERSION_ALLOWED", "NOTICE", builder=name, caller=caller,
+                   data={"version": version, "tested": list(opencode.TESTED_VERSIONS)})
+    return get(conn, name)
 
 
 def password(b, env=None):

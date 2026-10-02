@@ -100,6 +100,41 @@ def _parser(err):
     bs.add_argument("name")
     br = bsub.add_parser("remove", help="unregister a builder (owner)", err=err)
     br.add_argument("name")
+    bp = bsub.add_parser("pause", help="send only the owner's messages to this builder (owner)", err=err)
+    bp.add_argument("name")
+    bu = bsub.add_parser("resume", help="send everyone's messages to this builder again (owner)", err=err)
+    bu.add_argument("name")
+    bv = bsub.add_parser("allow-version", help="accept an untested OpenCode version for this builder (owner)",
+                         err=err)
+    bv.add_argument("name")
+    bv.add_argument("version")
+    se = add("send", "queue a message for a builder; it is sent once the builder is ready")
+    se.add_argument("builder")
+    src = se.add_mutually_exclusive_group(required=True)
+    src.add_argument("--message", help="the message text")
+    src.add_argument("--file", help="read the message text from this file")
+    se.add_argument("--key", help="idempotency key: sending again with the same key and text does nothing new "
+                    "(default: a fresh key, printed)")
+    qu = add("queue", "messages queued or in flight")
+    qu.add_argument("builder", nargs="?")
+    qu.add_argument("--all", action="store_true", help="include settled messages")
+    ms = add("msg", "inspect or decide on one message")
+    msub = ms.add_subparsers(dest="msg_cmd", parser_class=_Parser)
+    msub.required = True
+    mshow = msub.add_parser("show", help="show a message and its state", err=err)
+    mshow.add_argument("id")
+    mshow.add_argument("--body", action="store_true", help="include the text")
+    mcan = msub.add_parser("cancel", help="withdraw a message (a copy already inside the builder stays watched)",
+                           err=err)
+    mcan.add_argument("id")
+    mres = msub.add_parser("resolve", help="decide on an UNCERTAIN or STRANDED message", err=err)
+    mres.add_argument("id")
+    mres.add_argument("choice", choices=["wait", "cancel", "resend"])
+    mres.add_argument("--confirm-may-run-twice", action="store_true",
+                      help="required for resend: the original may still run as well")
+    sa = add("stop-all", "send nothing to any builder until the owner resumes")
+    sa.add_argument("--reason")
+    add("resume-all", "end stop-all (owner)")
     dr = add("director", "register the Claude Code session that directs builders")
     dsub = dr.add_subparsers(dest="director_cmd", parser_class=_Parser)
     dsub.required = True
@@ -375,6 +410,10 @@ def cmd_builder(ctx):
     c = _owner_or_refuse(ctx)
     if a.builder_cmd == "remove":
         return c.call("POST", "/v1/builders/remove", {"name": a.name})
+    if a.builder_cmd in ("pause", "resume"):
+        return c.call("POST", f"/v1/builders/{a.builder_cmd}", {"name": a.name})
+    if a.builder_cmd == "allow-version":
+        return c.call("POST", "/v1/builders/allow-version", {"name": a.name, "version": a.version})
     body = {"name": a.name, "endpoint": a.endpoint, "session_id": a.session, "directory": a.directory,
             "check": not a.no_check}
     if a.password_env:
@@ -382,6 +421,49 @@ def cmd_builder(ctx):
     if a.password_file:
         body["password_file"] = os.path.abspath(a.password_file)
     return c.call("POST", "/v1/builders", body)
+
+
+def cmd_send(ctx):
+    a = ctx["args"]
+    if a.file:
+        with open(a.file, encoding="utf-8") as f:
+            text = f.read()
+    else:
+        text = a.message
+    key = a.key or "cli-" + secrets.token_hex(8)
+    r = _client(ctx).call("POST", "/v1/send", {"builder": a.builder, "body": text, "client_key": key})
+    r["client_key"] = key
+    return r
+
+
+def cmd_queue(ctx):
+    a = ctx["args"]
+    q = {}
+    if a.builder:
+        q["builder"] = a.builder
+    if a.all:
+        q["all"] = "1"
+    return _client(ctx).call("GET", "/v1/queue" + ("?" + urllib.parse.urlencode(q) if q else ""))
+
+
+def cmd_msg(ctx):
+    a = ctx["args"]
+    c = _client(ctx)
+    if a.msg_cmd == "show":
+        return c.call("GET", "/v1/message?" + urllib.parse.urlencode({"id": a.id, "body": "1" if a.body else "0"}))
+    if a.msg_cmd == "cancel":
+        return c.call("POST", "/v1/cancel", {"id": a.id})
+    return c.call("POST", "/v1/message/resolve", {"id": a.id, "choice": a.choice,
+                                                  "confirm_may_run_twice": a.confirm_may_run_twice})
+
+
+def cmd_stop_all(ctx):
+    body = {"reason": ctx["args"].reason} if ctx["args"].reason else {}
+    return _client(ctx).call("POST", "/v1/stop-all", body)
+
+
+def cmd_resume_all(ctx):
+    return _owner_or_refuse(ctx).call("POST", "/v1/resume-all", {})
 
 
 def cmd_director(ctx):
@@ -484,6 +566,7 @@ COMMANDS = {
     "events": cmd_events, "ack": cmd_ack, "show": cmd_show, "verify-journal": cmd_verify, "prune": cmd_prune,
     "backup": cmd_backup, "restore": cmd_restore, "restore-confirm": cmd_restore_confirm, "token": cmd_token,
     "builder": cmd_builder, "director": cmd_director, "quarantine": cmd_quarantine,
+    "send": cmd_send, "queue": cmd_queue, "msg": cmd_msg, "stop-all": cmd_stop_all, "resume-all": cmd_resume_all,
 }
 
 

@@ -6,10 +6,33 @@ outside them Imperium observes only [M-5].
 import base64
 import http.client
 import json
+import secrets
+import threading
+import time
 import urllib.parse
 
 TESTED_VERSIONS = ("1.18.32",)
 LOOPBACK = {"localhost", "127.0.0.1", "::1", "[::1]"}
+
+
+_BASE62 = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+_id_lock = threading.Lock()
+_id_last = [0, 0]
+
+
+def message_id(prefix="msg"):
+    """A message id in OpenCode's own format, so Imperium can name a message before sending it and later find
+    exactly that message (opencode/src/id/id.ts: 6 bytes of ms*0x1000+counter as hex, then 14 random base62).
+    Ids ascend with time, as OpenCode's do, so the message sorts after everything already in the session."""
+    with _id_lock:
+        ms = int(time.time() * 1000)
+        if ms == _id_last[0]:
+            _id_last[1] += 1
+        else:
+            _id_last[0], _id_last[1] = ms, 1
+        n = ms * 0x1000 + _id_last[1]
+    tail = "".join(secrets.choice(_BASE62) for _ in range(14))
+    return f"{prefix}_{n & 0xFFFFFFFFFFFF:012x}{tail}"
 
 
 class OCError(RuntimeError):

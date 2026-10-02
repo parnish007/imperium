@@ -4,7 +4,7 @@
 
 A director is an AI session that plans and reviews work (for example a Claude Code session). A builder is a coding agent that does the work (OpenCode first). A human *owner* stays in charge of both.
 
-> **Status: pre-alpha.** Stages 1-2 of 9 are built: the store, the event journal, the reading feeds, the background service, the command line, and *watching* OpenCode builders (everything a builder does becomes an event). Prompt delivery, rounds and claim verification, approvals, the MCP server and the dashboard are designed but **not built yet**. Do not rely on it for real work.
+> **Status: pre-alpha.** Stages 1-3 of 9 are built: the store, the event journal, the reading feeds, the background service, the command line, *watching* OpenCode builders (everything a builder does becomes an event), and *delivering* messages to them through a durable outbox. Rounds and claim verification, approvals, the MCP server and the dashboard are designed but **not built yet**. Do not rely on it for real work.
 
 ## Why
 
@@ -80,7 +80,15 @@ imperium doctor          # check the installation (`--contract` prints a setup r
 imperium down            # stop the service
 
 imperium builder add coding --endpoint http://127.0.0.1:<port> --session <ses_id> \n    --directory <workspace> --password-env OPENCODE_SERVER_PASSWORD   # watch an OpenCode session
-imperium builder list   # registered builders; `imperium status` shows reachability
+imperium builder list   # registered builders; `imperium status` shows reachability and why nothing is sent
+
+imperium send coding --message "..." --key fix-42   # queue a message; the same key and text never send twice
+imperium queue coding    # what is waiting or in flight
+imperium msg show <id>   # one message and its state
+imperium msg resolve <id> wait|cancel|resend [--confirm-may-run-twice]   # decide on an UNCERTAIN/STRANDED one
+imperium stop-all        # send nothing to anyone (`imperium resume-all`, owner, to undo)
+imperium builder pause coding                 # owner: only the owner's messages go to this builder
+imperium builder allow-version coding 1.19.0  # owner: accept an OpenCode version Imperium was not tested on
 
 # inside the Claude Code session that will direct (the owner authorises it):
 imperium --as owner director claim
@@ -90,6 +98,8 @@ imperium quarantine release --reason "..."   # owner, after inspecting a broken 
 ```
 
 Once a builder is registered, the service polls it and journals what happens: turns starting and ending, tool errors, permission asks, questions, retries, compactions, and any message that Imperium did not send (shown to you as CRITICAL). Builder text is treated as untrusted: secrets are redacted before anything is stored. The server password is never stored, only the name of the variable (or file) that holds it.
+
+A queued message is sent only when the builder is idle and stays idle, no permission or question is pending, no reply or sub-agent is still running, and its OpenCode version is one Imperium was tested on. One message is in flight per builder. Imperium names the message (in OpenCode's own id format) before sending it and proves delivery by finding exactly that id in the builder's history, never by matching text. Anything short of proof (a timeout, a dropped connection, an error after the server may have saved it) is looked up by id; if it is not found within a minute the message becomes **UNCERTAIN** and waits for your decision. Imperium never resends on its own: a resend may run twice, so it needs explicit confirmation, and if both copies run you are told (CRITICAL). A message saved but never run (a known OpenCode failure) becomes **STRANDED** and blocks the builder until decided. A queue that stays blocked for ten minutes raises an ACTION event saying why.
 
 Inside a Claude Code session the CLI acts as the *director* and never falls back to the owner's credential; the owner adds `--as owner` there. Every command takes `--json`. Exit codes: `0` ok, `1` error, `2` usage, `3` service not running, `4` refused, `5` integrity or doctor failure.
 
@@ -101,8 +111,8 @@ Configuration lives in `~/.imperium/imperium.toml`. Unknown keys are rejected.
 |---|---|---|
 | 1 | Store, journal and integrity chain, retention, backup and restore, feeds, call audit, service, CLI | **done** |
 | 2 | Watching OpenCode builders: turns, messages, permissions, questions, status, catch-up after downtime | **done** |
-| 3 | Queue, dispatcher and the delivery state machine, recovery | next |
-| 4 | Rounds, claims, escalation, builder MCP | planned |
+| 3 | Queue, dispatcher and the delivery state machine, recovery | **done** |
+| 4 | Rounds, claims, escalation, builder MCP | next |
 | 5 | Approvals, director identity, questions, path rules | planned |
 | 6 | Director MCP server, `watch`, tokens and the full local API | planned |
 | 7 | Liveness (sub-agent aware) and resource gates | planned |

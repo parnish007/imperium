@@ -6,7 +6,12 @@ Shapes follow the OpenCode source (packages/schema/src/v1/*.ts, server/routes/in
 - GET /session/status lists only sessions that are not idle;
 - basic auth with user "opencode" when a password is set; `?directory=` scopes session lookups.
 Quirks (switch on with `quirks`): "perm_list_400" (the permission list fails, as in 1.18.32 with a websearch
-ask), "rate_limit" (next requests get 429), "drop_prompt" (#46842: a prompt is saved but never run).
+ask), "rate_limit" (next requests get 429), "drop_prompt" (#46842: a prompt is saved but never run),
+"error_after_persist" (saved, then HTTP 500), "error_before_persist" (HTTP 500, nothing saved),
+"drop_after_persist" (saved, then the connection closes without a reply), "fail_async" (HTTP 204, but the
+background save fails, as `prompt_async` answers before saving: handlers/session.ts:311-329).
+With `auto_run` (default on) a saved prompt runs at once when the session is idle: an assistant reply with
+`parentID` = the prompt's id. `runs[message_id]` counts executions, so tests can assert "ran at most once".
 """
 import base64
 import http.server
@@ -45,6 +50,8 @@ class FakeOpenCode:
         self.permission_replies = []
         self.question_replies = []
         self.aborts = []
+        self.auto_run = True
+        self.runs = {}
         self.server = _Server(("127.0.0.1", 0), _Handler)
         self.server.fake = self
         self.port = self.server.server_address[1]
@@ -169,6 +176,20 @@ class FakeOpenCode:
             self.questions.append(q)
             return q
 
+    def run(self, sid, mid):
+        """Execute a saved user message once: the builder's reply to it."""
+        with self.lock:
+            self.runs[mid] = self.runs.get(mid, 0) + 1
+            return self.add_assistant(sid, parent_id=mid, text="done")
+
+    def run_pending(self, sid):
+        """Run every saved user message that has no reply yet (what OpenCode's loop does when it resumes)."""
+        with self.lock:
+            answered = {m["info"].get("parentID") for m in self.messages[sid] if m["info"]["role"] == "assistant"}
+            for m in list(self.messages[sid]):
+                if m["info"]["role"] == "user" and m["info"]["id"] not in answered and m["parts"]:
+                    self.run(sid, m["info"]["id"])
+
     def restart(self, version=None):
         """Simulate a server restart: state persists (it is on disk in OpenCode), status resets."""
         with self.lock:
@@ -241,7 +262,11 @@ class FakeOpenCode:
         return 404, {"name": "NotFoundError"}, {}
 
     def _prompt(self, sid, body):
+        if "error_before_persist" in self.quirks:
+            return 500, {"error": "internal"}, {}
         mid = body.get("messageID") or self._id("msg")
+        if "fail_async" in self.quirks:
+            return 204, None, {}
         parts = []
         for p in body.get("parts") or []:
             q = dict(p)
@@ -251,6 +276,12 @@ class FakeOpenCode:
         info = {"id": mid, "sessionID": sid, "role": "user", "time": {"created": self._now()},
                 "agent": body.get("agent", "build"), "model": {"providerID": "fake", "modelID": "fake-1"}}
         self._insert(sid, {"info": info, "parts": parts, "_parts": parts})
+        if self.auto_run and "drop_prompt" not in self.quirks and sid not in self.status:
+            self.run(sid, mid)
+        if "error_after_persist" in self.quirks:
+            return 500, {"error": "internal"}, {}
+        if "drop_after_persist" in self.quirks:
+            return "DROP", None, {}
         return 204, None, {}
 
     def _page(self, sid, query):
@@ -286,6 +317,9 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         body = json.loads(self.rfile.read(length)) if length else None
         status, payload, headers = self.server.fake.handle(method, url.path, urllib.parse.parse_qs(url.query),
                                                            body, self.headers)
+        if status == "DROP":  # close without a reply: the client sees a broken connection
+            self.close_connection = True
+            return
         data = b"" if payload is None else json.dumps(payload).encode()
         self.send_response(status)
         for k, v in headers.items():
