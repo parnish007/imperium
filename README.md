@@ -1,3 +1,8 @@
+<p align="center">
+  <img src="docs/assets/imperium-logo.gif" width="840"
+       alt="A terminal types imperium status; IMPERIUM appears in block letters, then the evidence trail brief, claim, checks, objective, accepted is marked step by step">
+</p>
+
 # Imperium: a supervisor for AI coding agents
 
 **Imperium is an open-source, local supervisor for AI coding agents such as Claude Code, OpenCode, Codex and Gemini
@@ -127,7 +132,7 @@ imperium stop-all / resume-all                          # the emergency brake an
 imperium backup / restore <file> / verify-journal / export --out f.jsonl / doctor / down
 ```
 
-Every command takes `--json`. Configuration lives in `~/.imperium/imperium.toml`; to be notified outside the feed,
+The [step-by-step guide](HOWTOUSE.md) walks through all of this in detail. Every command takes `--json`. Configuration lives in `~/.imperium/imperium.toml`; to be notified outside the feed,
 set `[notify] command` (see the [specification](docs/SPEC.md), section 7.1).
 
 ## How a round is verified
@@ -215,6 +220,7 @@ Windows, Linux and macOS; tested on all three with Python 3.11 and 3.13.
 
 ## Documentation
 
+- [How to use Imperium](HOWTOUSE.md): step-by-step guide, from install to everyday use
 - [Specification](docs/SPEC.md): every guarantee, state and limit
 - [Isolation mode](docs/ISOLATION.md): agents under their own account
 - [Benchmarks](docs/benchmarks.md): measured numbers and the comparison sources

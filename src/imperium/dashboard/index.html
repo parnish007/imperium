@@ -4,39 +4,82 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="referrer" content="no-referrer">
+<meta name="color-scheme" content="dark light">
 <title>Imperium</title>
+<link rel="preload" href="/dashboard/plex-sans.woff2" as="font" type="font/woff2" crossorigin>
+<link rel="preload" href="/dashboard/plex-mono-400.woff2" as="font" type="font/woff2" crossorigin>
+<link rel="preload" href="/dashboard/fraunces.woff2" as="font" type="font/woff2" crossorigin>
 <link rel="stylesheet" href="/dashboard/app.css">
 <script src="/dashboard/app.js" defer></script>
 </head>
-<body>
-<header>
-  <h1>Imperium</h1>
-  <span id="conn" class="pill">connecting</span>
-  <span id="chain" class="pill"></span>
-  <span id="updated" class="muted"></span>
+<body class="no-data">
+<header class="masthead">
+  <div class="brand">
+    <h1 class="wordmark"><span id="logo" class="logo" role="img" aria-label="Imperium"></span></h1>
+    <span class="role">supervising your coding agents</span>
+  </div>
+  <dl class="vitals">
+    <div><dt>Record</dt><dd id="chain">&hellip;</dd></div>
+    <div><dt>AI director</dt><dd id="director">&hellip;</dd></div>
+    <div><dt>Updated</dt><dd id="conn">connecting</dd></div>
+  </dl>
 </header>
+
+<div id="brake" class="brake" hidden></div>
+
 <main>
-  <section id="needs">
-    <h2>Needs you</h2>
-    <ul id="needs-list" class="list"></ul>
+  <section class="summary" aria-live="polite">
+    <p id="summary-head" class="summary-head">Loading&hellip;</p>
+    <p id="summary-sub" class="summary-sub"></p>
   </section>
-  <section>
-    <h2>Builders</h2>
-    <table id="fleet"><thead><tr><th>Builder</th><th>State</th><th>Queue</th><th>In flight</th><th>Why nothing is sent</th><th>OpenCode</th></tr></thead><tbody></tbody></table>
+
+  <section class="needs" aria-labelledby="needs-h">
+    <h2 id="needs-h">Needs you</h2>
+    <ol id="needs" class="slips"></ol>
   </section>
-  <section>
-    <h2>Rounds</h2>
-    <table id="rounds"><thead><tr><th>Round</th><th>Builder</th><th>State</th><th>Gen</th><th>Escalation</th><th>Objective</th></tr></thead><tbody></tbody></table>
+
+  <section class="agents" aria-labelledby="agents-h">
+    <h2 id="agents-h">Agents</h2>
+    <ul id="agents" class="agent-list"></ul>
   </section>
-  <section>
-    <h2>Delivery ledger</h2>
-    <table id="ledger"><thead><tr><th>Message</th><th>Builder</th><th>From</th><th>Kind</th><th>State</th><th>Queued</th><th>Round</th></tr></thead><tbody></tbody></table>
+
+  <section class="rounds" aria-labelledby="rounds-h">
+    <div class="section-head">
+      <h2 id="rounds-h">Work</h2>
+      <p class="legend">
+        <span class="seal-key proven" aria-hidden="true"></span>done
+        <span class="seal-key open" aria-hidden="true"></span>not yet
+        <span class="seal-key broken" aria-hidden="true"></span>failed
+      </p>
+    </div>
+    <ul id="rounds" class="dockets"></ul>
   </section>
-  <section>
-    <h2>Recent events</h2>
-    <ul id="events" class="list mono"></ul>
+
+  <section class="ledger" aria-labelledby="ledger-h">
+    <h2 id="ledger-h">Instructions sent</h2>
+    <div class="scroll" tabindex="0" role="region" aria-labelledby="ledger-h">
+      <table id="ledger">
+        <thead><tr><th scope="col">Instruction</th><th scope="col">To</th><th scope="col">From</th><th scope="col">Status</th><th scope="col">Sent</th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="journal" aria-labelledby="journal-h">
+    <div class="section-head">
+      <h2 id="journal-h">Activity</h2>
+      <button id="journal-all" class="toggle" type="button" aria-pressed="false">Show everything</button>
+    </div>
+    <div class="scroll" tabindex="0" role="region" aria-labelledby="journal-h">
+      <ol id="journal" class="entries"></ol>
+    </div>
   </section>
 </main>
-<footer class="muted">Read-only. Builder text is never shown here; use <code>imperium show &lt;seq&gt;</code>. The token lives only in this tab: reload means running <code>imperium dashboard</code> again.</footer>
+
+<footer>
+  <p>This page only shows what is happening; it cannot change anything. To act, run the commands it shows in your
+  terminal. It never shows what your agents wrote: to read an event in full, run <code>imperium show &lt;number&gt;</code>.</p>
+  <p>The link works in this tab only. After a reload, run <code>imperium dashboard</code> for a new one.</p>
+</footer>
 </body>
 </html>

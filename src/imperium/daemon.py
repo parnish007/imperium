@@ -131,7 +131,8 @@ def r_status(d, principal, body, query):
             cp = json.loads(r[0]) if r else {}
             queued = conn.execute("SELECT COUNT(*) FROM outbox WHERE builder=? AND state='QUEUED'",
                                   (b["name"],)).fetchone()[0]
-            bl.append({"name": b["name"], "endpoint": b["endpoint"], "session_id": b["session_id"],
+            bl.append({"name": b["name"], "adapter": b["adapter"], "endpoint": b["endpoint"],
+                       "session_id": b["session_id"],
                        "opencode_version": b["opencode_version"], "allowed_version": b["allowed_version"],
                        "paused": bool(b["paused"]), "status": cp.get("status"),
                        "permissions_pending": cp.get("permissions"), "questions_pending": cp.get("questions"),
@@ -967,6 +968,8 @@ def _opt_int(body, key):
 
 DASHBOARD_FILES = {"/dashboard": "index.html", "/dashboard/": "index.html", "/dashboard/app.js": "app.js",
                    "/dashboard/app.css": "app.css"}
+DASHBOARD_FILES.update({f"/dashboard/{n}": n for n in ("fraunces.woff2", "plex-sans.woff2", "plex-mono-400.woff2",
+                                                       "plex-mono-600.woff2")})
 DASHBOARD_IDLE = 12 * 3600
 
 
@@ -1060,18 +1063,19 @@ class _Handler(http.server.BaseHTTPRequestHandler):
                 data = f.read()
         except OSError:
             data, name = b"not found", "x.txt"
-        ctype = {"html": "text/html", "js": "text/javascript", "css": "text/css"}.get(name.rsplit(".", 1)[-1],
-                                                                                    "text/plain")
+        ctype = {"html": "text/html; charset=utf-8", "js": "text/javascript; charset=utf-8",
+                 "css": "text/css; charset=utf-8", "woff2": "font/woff2"}.get(name.rsplit(".", 1)[-1],
+                                                                             "text/plain; charset=utf-8")
         allowed = {f"127.0.0.1:{self.server.imperium.port}", f"localhost:{self.server.imperium.port}"}
         if (self.headers.get("Host") or "").lower() not in allowed:
-            data, ctype = b"bad Host header", "text/plain"
+            data, ctype = b"bad Host header", "text/plain; charset=utf-8"
         self.send_response(200)
-        self.send_header("Content-Type", ctype + "; charset=utf-8")
+        self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(data)))
         self.send_header("Cache-Control", "no-store")
         self.send_header("Content-Security-Policy", "default-src 'none'; script-src 'self'; style-src 'self'; "
-                         "connect-src 'self'; img-src 'self'; base-uri 'none'; frame-ancestors 'none'; "
-                         "form-action 'none'")
+                         "connect-src 'self'; img-src 'self'; font-src 'self'; base-uri 'none'; "
+                         "frame-ancestors 'none'; form-action 'none'")
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("Referrer-Policy", "no-referrer")
         self.end_headers()

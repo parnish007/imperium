@@ -17,6 +17,7 @@ Key facts:
 ## Docs
 
 - [README](https://github.com/parnish007/imperium/blob/main/README.md): what it is, install, quick start, FAQ
+- [How to use](https://github.com/parnish007/imperium/blob/main/HOWTOUSE.md): step-by-step guide, from install to everyday use
 - [Specification](https://github.com/parnish007/imperium/blob/main/docs/SPEC.md): guarantees, states and limits
 - [Isolation mode](https://github.com/parnish007/imperium/blob/main/docs/ISOLATION.md): agents under their own account
 - [Benchmarks](https://github.com/parnish007/imperium/blob/main/docs/benchmarks.md): measured numbers, comparison sources
