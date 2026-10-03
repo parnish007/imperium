@@ -5,11 +5,33 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "imperium-ai"
 version = "0.1.0.dev0"
-description = "An accountability layer between an AI director, AI coding builders and their human owner: durable message delivery with proof, an acknowledged event journal, and rounds verified by trusted checks on code snapshots."
+description = "Local supervisor for AI coding agents (Claude Code, OpenCode, Codex, Gemini CLI): delivery with proof, an event journal, approvals, and work verified by trusted checks on code snapshots."
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.11"
 dependencies = []
+keywords = ["ai agents", "coding agents", "agent supervisor", "multi-agent", "orchestration", "claude code", "opencode",
+            "codex", "gemini cli", "mcp", "model context protocol", "agent client protocol", "acp", "human in the loop",
+            "verification", "llm", "devtools"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: MacOS",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Quality Assurance",
+    "Topic :: Software Development :: Testing",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+[project.urls]
+Homepage = "https://github.com/parnish007/imperium"
+Documentation = "https://github.com/parnish007/imperium/blob/main/docs/SPEC.md"
+Issues = "https://github.com/parnish007/imperium/issues"
 
 [project.optional-dependencies]
 liveness = ["psutil>=5.9"]

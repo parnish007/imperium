@@ -16,7 +16,7 @@ the owner can always overrule. Each rule below is tagged with where it comes fro
    again; nothing is skipped, at worst something is shown twice. *(design guarantee F1)*
 2. **One objective per round.** `round_open` with an objective a reviewer could check: what must be true when it is
    done, which files are in scope, what is out of scope. A new phase of work is a new round; a fix inside the same
-   objective is a `round_message` (it starts a new generation). *(validated in stage 4 tests)*
+   objective is a `round_message` (it starts a new generation).
 3. **Define the checks before the builder finishes**, ideally before it starts:
    - at least one check that fails on the code before the round (`must_fail_on_base`): a check that passes either
      way does not test the change; *(paper P1, held-out tests; Agent Deck lesson)*

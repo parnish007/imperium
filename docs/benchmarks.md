@@ -55,9 +55,9 @@ after opening. Stopping Imperium stopped the agent. One run.
 ## The test suite
 
 Unit, integration and fault tests, including mutation checks: for each guarantee a deliberate bug was put back
-and a test had to fail. Stage 3: 27 single and 5 paired mutations, all caught. Stage 4: 25, 24 caught (the
-survivor is guarded twice; removing the second guard is caught). Stages 5-9: 27; 22 caught at first, 24 after two tests were
-added; each of the 3 survivors has a second guard that still holds (for the presence lease, removing that second guard is caught).
+and a test had to fail. Of 120 such bugs, 115 were caught; each of the other 5 is blocked by a second guard that
+still holds (for example, a check repeated at the API route). Where a mutation first survived, a test was added.
+The suite runs on Windows, Linux and macOS with Python 3.11 and 3.13.
 
 ## Other tools: features, from their source or documentation
 

@@ -1,61 +1,78 @@
-# Imperium
+# Imperium: a supervisor for AI coding agents
 
-**Imperium sits between an AI *director* and the AI *builders* it supervises, and makes sure nothing between them is lost, duplicated or taken on trust.**
+**Imperium is an open-source, local supervisor for AI coding agents such as Claude Code, OpenCode, Codex and Gemini
+CLI.** It sits between the AI that plans the work (the *director*), the coding agents that do it (the *builders*),
+and you (the *owner*). It makes sure no instruction is lost or silently sent twice, no event goes unread, no
+permission prompt waits unseen, and no agent's "done" is accepted until checks the agent cannot edit have passed on
+a snapshot of the code.
 
-A director is an AI session that plans and reviews work (for example a Claude Code session). A builder is a coding agent that does the work (OpenCode first). A human *owner* stays in charge of both.
+It runs on your own machine as one small Python service with SQLite: no cloud, no account, no dependencies outside
+the standard library.
 
-> **Status: pre-alpha.** All nine planned stages are built and tested against a fake OpenCode server reproducing OpenCode 1.18.32's behaviour and known bugs; see [Testing](#testing) for what has and has not been run against a real server. Expect rough edges.
+[![tests](https://github.com/parnish007/imperium/actions/workflows/tests.yml/badge.svg)](https://github.com/parnish007/imperium/actions/workflows/tests.yml)
+![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue)
+![Licence: MIT](https://img.shields.io/badge/licence-MIT-green)
+![Windows, Linux, macOS](https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-lightgrey)
 
-## Why
+## The problem it solves
 
-Running coding agents unattended for hours fails in ways that are easy to miss:
+Running AI coding agents for hours without watching them fails in ways that are easy to miss:
 
-- a prompt is sent twice after a timeout, or silently lost in a client-side queue;
-- the builder sits on a permission prompt nobody saw;
-- the director's monitor dies and events are never read;
-- the builder says "done" when half the work is done, or deletes the failing test;
-- a sub-agent is still working while the main agent looks idle.
+- a prompt is **sent twice** after a timeout, or **silently lost** in a client-side queue;
+- the agent sits on a **permission prompt** nobody saw;
+- the orchestrating session's monitor dies and **events are never read**;
+- the agent says **"done"** when half the work is done, or deletes the failing test so the suite passes;
+- a **sub-agent** is still working while the main agent looks idle, and the next prompt interrupts it.
 
-Imperium's job is to make each of these visible and recoverable.
+Imperium makes each of these visible, recorded and recoverable.
 
-## What it does (design goals)
+## Features
 
-1. **Never turns uncertainty into success or into a silent retry.** Every prompt ends in a recorded outcome: not sent, delivered (proven by finding Imperium's own message in the builder's history), delivery uncertain, duplicate detected, or resent by an explicit decision. Against a builder that cannot deduplicate, no outside tool can promise exactly-once delivery; Imperium's promise is that every exception is visible and decided by someone, never guessed. Prompts go out only when the builder is ready (idle, nothing pending, no sub-agent working).
-2. **Records every state change and builder event** in one append-only journal with an integrity chain. (API-call telemetry is kept separately, with bounded retention.) Each reader has its own feed and bookmark, and the bookmark cannot be moved past what the reader was actually shown.
-3. **Tracks rounds of work.** A builder's "done" is a *claim*. It becomes *verified* only when configured checks pass on a snapshot of the code, and *accepted* only by the director or the owner.
-4. **Keeps the owner in control.** Trust-changing actions need the owner's credential, there is a global stop, and nothing is approved "always" on the owner's behalf. (Read the security model: on one OS user this is a protocol, not a wall.)
-5. **Runs on one modest machine**: one small Python service, SQLite, no cloud.
+- **Delivery with proof.** Every instruction ends in a recorded outcome. "Delivered" means Imperium found its own
+  message id in the agent's history, never that an HTTP call returned 200. Uncertain cases wait for a decision;
+  Imperium never resends on its own. Prompts go out only when the agent is truly idle (no pending permission, no
+  question, no busy sub-agent).
+- **Verified work, not claimed work.** Work is organised in *rounds*. An agent's "done" is a claim. It becomes
+  *verified* only when trusted checks pass on a snapshot of the code, in a fresh copy outside the live workspace,
+  with the checks' own files unchanged, and a check must fail without the change to count. It is *accepted* only by
+  a named person or director.
+- **Permission approvals with a human in the loop.** Your rules can answer an agent's permission prompts
+  automatically, but only while the director is present, and every automatic answer is listed for you to review.
+  Deny rules always win.
+- **An event journal you can trust.** One append-only journal with a hash chain; each reader has its own feed and
+  bookmark, and nothing is marked read before it was shown. Integrity failures stop everything that acts until you
+  inspect them.
+- **Liveness that understands sub-agents.** Working, waiting for approval, waiting for an answer, stalled, hung:
+  reported, never killed behind your back.
+- **Works with your agents.** OpenCode over its HTTP server, and any agent that speaks the
+  [Agent Client Protocol](https://agentclientprotocol.com) (ACP), which Imperium starts and drives itself: OpenCode,
+  Gemini CLI, and Claude Code or Codex through their ACP adapters.
+- **Built for Claude Code as the director.** A generated Claude Code plugin with an MCP server, hooks and a
+  playbook skill; any MCP client can use the director tools.
+- **Isolation mode.** Run agents under their own operating-system account and let them reach Imperium only through
+  a named pipe (Windows) or Unix socket (Linux, macOS) that checks who is at the other end.
+- **Notifications, dashboard, backups.** A command of your choice runs for anything that needs you; a read-only
+  browser dashboard; online backups and crash-safe restore.
 
 ## How it works
 
 ```
-  Director (AI)            Owner
-  MCP · CLI · hooks        CLI · dashboard (read-only)
-          \                  /
-           v                v
-   imperiumd: one local service, the only writer
-     local API on 127.0.0.1 with bearer tokens
-     SQLite (WAL) journal with an integrity chain
-     dispatcher · rounds · approvals · liveness
-           |
-           v
-   builder: OpenCode server (HTTP)
+  Director (an AI session)        Owner (you)
+  MCP tools · CLI · hooks         CLI · read-only dashboard · notifications
+              \                     /
+               v                   v
+      imperiumd: one local service, the only writer
+        local API on 127.0.0.1, bearer tokens (or OS-checked pipes in isolation mode)
+        SQLite journal with an integrity chain
+        delivery · rounds and checks · approvals · liveness
+               |                        |
+               v                        v
+      OpenCode server (HTTP)     any ACP agent (stdio, started by Imperium)
 ```
 
-- **One writer.** Only the service writes the database. A state change, its event and its checkpoint commit together.
-- **Fails closed.** If a write fails, the service stops dispatching and answering, and says so in every reply. If the journal's integrity chain is broken at start-up, Imperium goes into **quarantine**: reading and backups still work, but nothing that dispatches, decides or changes trust runs until the owner inspects it and releases it with a recorded reason.
-- **Feeds.** Each reader (director, owner) has a feed with a fixed minimum severity. Reading is strictly in order. A drain stops at a high-water mark, so it always ends. Acknowledging beyond what was shown is refused.
-- **Retention.** Only the oldest part of the journal can be pruned, and it is archived first, by a crash-safe protocol. The integrity chain still checks from the prune boundary.
-- **Backups** use SQLite's online backup API. After a restore, the service starts in observe-only mode until the owner confirms.
+The guarantees, and exactly what each one does *not* cover, are in the [specification](docs/SPEC.md).
 
-## Security model: read this
-
-- **Imperium is not a sandbox.** A builder running as your OS user can do anything you can, including reading Imperium's files and acting as the director. A builder hijacked by a malicious web page (prompt injection) is a realistic way for that to happen. If you need containment, run builders as another OS user, in a container or in a VM.
-- **"Owner-only" is enforced against software that follows the protocol, not against a hostile process.** The owner's token is a file in your runtime folder; any program running as your OS user, including a builder, can read it and act as the owner. A real boundary needs the builder under another OS user, in a container or a VM. **Isolation mode** runs builders under their own account and admits them only through a channel the operating system guards (a named pipe on Windows, a Unix socket on Linux and macOS; the account at the other end is checked on every connection): see [docs/ISOLATION.md](docs/ISOLATION.md).
-- The local API listens on `127.0.0.1` only, checks the `Host` and `Origin` headers (these stop web pages, not local programs), and needs a 256-bit bearer token. Tokens are stored hashed; the runtime folder is readable only by your user.
-- The journal's hash chain detects accidental corruption and naive edits. A process running as the same user could recompute it, so it is an integrity check, not proof.
-
-## Install (from source, for now)
+## Install
 
 Requires Python 3.11 or newer. [`uv`](https://docs.astral.sh/uv/) is the easiest way to get one.
 
@@ -69,93 +86,148 @@ uv tool install .        # or: pip install .
 
 ```
 imperium init                      # ~/.imperium (or $IMPERIUM_HOME): database, config, owner token
-imperium up                        # start the background service (idempotent)
+imperium up                        # start the background service
 
-# register an OpenCode session as a builder (its server: `opencode serve`)
+# a builder: an OpenCode session (from `opencode serve`) ...
 imperium builder add coding --endpoint http://127.0.0.1:<port> --session <ses_id> --directory <repo>
-imperium builder mcp-config coding --write    # adds Imperium's builder tool; restart OpenCode while idle
+imperium builder mcp-config coding --write    # gives it Imperium's report tool; restart OpenCode while idle
 
-# or let Imperium start any Agent Client Protocol agent itself (it gets the builder tool automatically)
+# ... or any Agent Client Protocol agent, which Imperium starts itself
 imperium builder add helper --acp "opencode acp" --directory <repo>
 
-# a trusted check: Imperium runs it on a snapshot, never in the live workspace
+# a trusted check: run on a snapshot, never in the live workspace
 imperium check add unit --builder coding --depends tests/test_calc.py --must-fail-on-base -- python -m pytest -q
 
 # one round of work
 imperium round open coding --objective "Make add() add; tests/test_calc.py must pass."
-imperium round list                # PENDING -> OPEN -> CLAIMED_READY ...
 imperium round verify <round> --wait 600
-imperium round objective <round> met --note "..."
-imperium round accept <round>      # refused unless VERIFIED and the workspace is unchanged
+imperium round objective <round> met
+imperium round accept <round>      # refused unless verified and the workspace is unchanged
 ```
 
-Then, for the director (a Claude Code session):
+Use Claude Code as the director:
 
 ```
-imperium plugin write ~/imperium-plugin       # skill, MCP server, hooks; validated with `claude plugin validate`
+imperium plugin write ~/imperium-plugin       # skill, MCP server, hooks
 claude --plugin-dir ~/imperium-plugin
-imperium --as owner director claim            # run once inside that session
+imperium --as owner director claim            # once, inside that session
 ```
 
-More:
+Everyday commands:
 
 ```
-imperium status / events / ack <seq> / show <seq>     # what happened; your feed and its bookmark
-imperium send coding --message "..." --key k1          # a message outside rounds
+imperium status / events / ack <seq> / show <seq>      # what happened; your feed and bookmark
+imperium send coding --message "..." --key k1           # a message outside rounds
 imperium queue / msg show <id> / msg resolve <id> wait|cancel|resend --confirm-may-run-twice
-imperium approvals / approve <id> / deny <id>          # permission asks; `approvals --auto`: what your rules answered
-imperium rule add bash "git status*" --allow           # owner: rules used only while the director is present
+imperium approvals / approve <id> / deny <id>           # permission prompts; --auto lists what your rules answered
+imperium rule add bash "git status*" --allow            # owner rules, used only while the director is present
 imperium questions / answer <id> --choice "A"
-imperium round diff <round> / round message <round> --message "..." / round reject <round>
-imperium check list / check approve <id> (owner) / check retire <id> (owner)
-imperium gate                      # enough free memory for heavy work? (`send --needs-resources` waits for it)
-imperium dashboard                 # read-only view in your browser
-imperium watch --consumer director # new headlines as they arrive (for a monitor); never acknowledges
-imperium stop-all / resume-all     # the emergency brake (anyone) and its release (owner)
+imperium dashboard                                      # read-only view in your browser
+imperium stop-all / resume-all                          # the emergency brake and its release
 imperium backup / restore <file> / verify-journal / export --out f.jsonl / doctor / down
 ```
 
-To be told about anything that needs you (ACTION and CRITICAL events) outside the feed, set a command in `[notify]`; see [docs/SPEC.md](docs/SPEC.md) §7.1.
-
-Every command takes `--json`. Exit codes: `0` ok, `1` error, `2` usage, `3` service not running, `4` refused, `5` integrity or doctor failure. Inside a Claude Code session the CLI acts as the director and never falls back to the owner's credential; the owner adds `--as owner` there. Configuration: `~/.imperium/imperium.toml` (unknown keys are rejected).
+Every command takes `--json`. Configuration lives in `~/.imperium/imperium.toml`; to be notified outside the feed,
+set `[notify] command` (see the [specification](docs/SPEC.md), section 7.1).
 
 ## How a round is verified
 
-1. When the round opens, its brief (objective, nonce, how to report, when to escalate) is queued and the code is snapshotted just before the brief is sent.
-2. The builder reports `ready` through its tool (or a claim file), quoting the round's nonce and current generation. A claim is evidence, not acceptance.
-3. `round verify` snapshots the code again and, for each trusted check: refuses to trust it if a file it depends on changed (only the owner can approve new versions); runs it in a fresh copy of the snapshot with a minimal environment and a timeout; runs it on the starting snapshot too when it must fail there (a check that passes without the change does not test the change); records the executable and its hash, the environment names, the exit code and the output.
-4. A person or the director records whether the objective is met. Only then is the round VERIFIED.
-5. Accept is refused if the workspace changed since the verified snapshot. A repair message starts a new generation and voids VERIFIED.
+1. When the round opens, its brief (objective, nonce, how to report, when to escalate) is queued, and the code is
+   snapshotted just before it is sent.
+2. The agent reports `ready` through its tool, quoting the round's nonce and generation. A claim is evidence, not
+   acceptance.
+3. `round verify` snapshots the code again. For each trusted check it refuses to trust the check if a file it
+   depends on changed (only the owner approves new versions), runs it in a fresh copy with a minimal environment and
+   a timeout, runs it on the starting snapshot when it must fail there, and records the executable and its hash, the
+   environment, the exit code and the output.
+4. A person or the director records whether the objective is met. Only then is the round verified.
+5. Accept is refused if the workspace changed since the verified snapshot. A follow-up message starts a new
+   generation and voids the verification.
 
-The details, and what each guarantee does *not* cover, are in [docs/SPEC.md](docs/SPEC.md).
+## How it compares
 
-## Roadmap
+| | Message delivery | What counts as "done" | Platforms |
+|---|---|---|---|
+| **Imperium** | durable queue; proof by the message's own id; uncertain outcomes wait for a decision | trusted checks on a code snapshot, then a named person's or director's acceptance | Windows, Linux, macOS |
+| Agent Deck | durable at-most-once outbox, typed into tmux panes | a rule in the conductor's prompt, not enforced by the tool | macOS, Linux, WSL |
+| Gas City | work items pulled from a store; fire-and-forget wake-up | the agent closes the work item | tmux platforms |
+| Claude Squad | tmux sessions with worktrees | the human reviews the diff | tmux platforms |
 
-| Stage | Content | State |
-|---|---|---|
-| 1 | Store, journal and integrity chain, retention, backup and restore, feeds, call audit, service, CLI | **done** |
-| 2 | Watching OpenCode builders: turns, messages, permissions, questions, status, catch-up after downtime | **done** |
-| 3 | Queue, dispatcher and the delivery state machine, recovery | **done** |
-| 4 | Rounds, claims, escalation, trusted checks on snapshots, builder MCP | **done** |
-| 5 | Approvals with presence lease and the automatic-answer report, questions, path rules | **done** |
-| 6 | Director MCP server, `watch`, the full local API | **done** |
-| 7 | Liveness (sub-agent aware) and the resource gate | **done** |
-| 8 | Claude Code plugin and the director's playbook | **done** |
-| 9 | Read-only dashboard | **done** |
-| — | Isolation mode (Windows pipes, Unix sockets), owner notifications, CI on three systems | **done** |
-| — | Second adapter: any Agent Client Protocol agent (OpenCode, Gemini CLI, Claude Code, Codex via ACP) | **done** |
+Imperium can also sit *under* these tools: it supervises delivery and verification, not your workflow. Sources and
+measured numbers are in [docs/benchmarks.md](docs/benchmarks.md).
 
-Next: dashboard actions; questions from ACP agents.
+## Measured
 
-## Testing
+- 600 messages under random faults (dropped connections, servers that answer before saving, crashes right after a
+  request): **0 lost, 0 silent duplicates**.
+- Idle service: about **29 MB** of memory.
+- Real rounds against OpenCode, over HTTP and over ACP: brief delivered, code fixed, checks passed on the change and
+  failed without it, accepted.
 
-The core uses only the Python standard library (Python 3.11 or newer). The tests are part of the product: crash and fault cases, tampering, restore, idempotency, history catch-up and a fake OpenCode server with its known quirks. Run them with:
+Details and how to reproduce them: [docs/benchmarks.md](docs/benchmarks.md).
+
+## Security model
+
+- **Imperium is not a sandbox.** An agent running as your operating-system user can do anything you can, including
+  reading Imperium's files. A prompt-injected agent is a realistic way for that to happen. For containment, run
+  agents under another account ([isolation mode](docs/ISOLATION.md)), in a container or in a VM.
+- Without isolation mode, "owner-only" holds against software that follows the protocol, not against a hostile
+  process running as you.
+- The local API listens on `127.0.0.1` only, checks `Host` and `Origin` (which stops web pages), and needs a
+  256-bit bearer token; tokens are stored hashed.
+- Nothing Imperium runs in an agent's repository executes the agent's git configuration (filters, diff drivers,
+  hooks).
+- The journal's hash chain detects corruption and naive edits; a process running as you could recompute it.
+
+## FAQ
+
+**What is Imperium?**
+A local, open-source supervisor for AI coding agents. It guarantees that instructions to agents are delivered with
+proof, that every event is recorded and read, and that an agent's claim of "done" is verified by checks the agent
+cannot edit before anyone accepts it.
+
+**Which coding agents does it work with?**
+OpenCode (attached to a running `opencode serve` session) and any Agent Client Protocol agent: OpenCode, Gemini
+CLI, and Claude Code or Codex through their ACP adapters. Live runs so far used OpenCode over both routes.
+
+**Can Claude Code supervise other agents with it?**
+Yes. `imperium plugin write` generates a Claude Code plugin with an MCP server, hooks and a playbook, so a Claude
+Code session can send work, read events, answer approvals, and verify and accept rounds.
+
+**How does it stop an AI agent from faking "tests pass"?**
+Checks are defined outside the agent's reach and run on a snapshot of the code in a fresh copy. If a file a check
+depends on changed, the check is not trusted until you approve it, and a check must fail on the code before the
+change to count as testing it.
+
+**Does it retry failed prompts automatically?**
+No. A prompt whose fate is unknown becomes *uncertain* and waits for a decision (wait, cancel, or resend knowing it
+may run twice). Silent retries are how instructions run twice.
+
+**Does it need the cloud or an API key?**
+No. It is one local Python service with SQLite and no third-party dependencies. Your agents use whatever models
+they are configured with.
+
+**Is it a sandbox?**
+No. See the security model above and [isolation mode](docs/ISOLATION.md).
+
+**Which operating systems?**
+Windows, Linux and macOS; tested on all three with Python 3.11 and 3.13.
+
+## Documentation
+
+- [Specification](docs/SPEC.md): every guarantee, state and limit
+- [Isolation mode](docs/ISOLATION.md): agents under their own account
+- [Benchmarks](docs/benchmarks.md): measured numbers and the comparison sources
+
+## Tests
+
+The tests are part of the product: crash and fault cases, tampering, restore, idempotency, hostile
+repositories, isolation channels, a fake OpenCode server with its known quirks and a fake ACP agent run as a real
+process. They run on Windows, Linux and macOS.
 
 ```
 PYTHONPATH=src python -m unittest discover -s tests
 ```
-
-One test starts and stops a real background service.
 
 ## Licence
 

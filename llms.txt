@@ -1,0 +1,22 @@
+# Imperium
+
+> Imperium is an open-source, local supervisor for AI coding agents (Claude Code, OpenCode, Codex, Gemini CLI). It
+> sits between a director AI session, the coding agents doing the work, and their human owner. It delivers
+> instructions with proof (never silently lost or sent twice), records every event in a hash-chained journal,
+> routes agents' permission prompts to approvals with a human in the loop, and accepts an agent's "done" only after
+> trusted checks the agent cannot edit pass on a snapshot of the code.
+
+Key facts:
+- One local Python service (3.11+), standard library only, SQLite; no cloud, no account. MIT licence.
+- Agents: OpenCode over its HTTP server, and any Agent Client Protocol (ACP) agent, which Imperium starts itself.
+- Director: a generated Claude Code plugin (MCP server, hooks, playbook skill); any MCP client can use the tools.
+- Uncertain deliveries are never retried automatically; they wait for a decision.
+- Isolation mode runs agents under their own OS account, reachable only through an OS-checked named pipe or Unix socket.
+- Runs on Windows, Linux and macOS.
+
+## Docs
+
+- [README](https://github.com/parnish007/imperium/blob/main/README.md): what it is, install, quick start, FAQ
+- [Specification](https://github.com/parnish007/imperium/blob/main/docs/SPEC.md): guarantees, states and limits
+- [Isolation mode](https://github.com/parnish007/imperium/blob/main/docs/ISOLATION.md): agents under their own account
+- [Benchmarks](https://github.com/parnish007/imperium/blob/main/docs/benchmarks.md): measured numbers, comparison sources
