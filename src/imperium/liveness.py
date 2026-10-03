@@ -34,7 +34,7 @@ def operational_state(cp, health, builder, stop_all):
 
 def progress_fingerprint(cp):
     """Changes whenever the builder visibly moves: a new message, or a reply still being written grows."""
-    return [cp.get("last_id"), sorted((k, v.get("size")) for k, v in (cp.get("open") or {}).items()),
+    return [cp.get("last_id"), cp.get("progress_seq"), sorted((k, v.get("size")) for k, v in (cp.get("open") or {}).items()),
             sorted(cp.get("busy_children") or [])]
 
 

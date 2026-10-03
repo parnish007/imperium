@@ -22,9 +22,9 @@ What it does not give you:
   or use OpenCode over HTTP started under the builder account;
 - the builder can still change anything in its own workspace; that is why claims are verified on snapshots and why
   a check's files are hashed;
-- checks run as your account: a visible check runs code from the builder's repository (its tests). Keep the checks
-  that matter **held out**: scripts outside the workspace, listed in the check's `depends`, and review the round's
-  diff before approving changed check files.
+- checks default to restricted Linux containers. Isolation mode refuses `unsafe-local` verification. Held-out
+  checks protect test integrity, but an unchanged test may still import hostile candidate code; the container
+  boundary is required separately. See [VERIFICATION.md](VERIFICATION.md) for image setup and kernel/runtime limits.
 
 ## Setup on Windows
 

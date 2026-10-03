@@ -71,8 +71,9 @@ CANCELLED and SUPERSEDED messages stay watched: if one runs later, `LATE_ADMISSI
 All of these must hold, decided on the poll that has just completed (never on stale state):
 not stop-all; not observe-only after a restore; the session attached and history fully read; the OpenCode version
 tested, or allowed by the owner for this builder; the permission list readable and empty; no question pending;
-status idle for `idle_stable_polls` polls; no reply or user message still being written; no busy sub-agent session
-(children and deeper); no message in flight to this builder (one at a time); not paused (a paused builder takes
+status idle for `idle_stable_polls` polls; no reply or user message still being written; no observed busy sub-agent
+session for HTTP (children and deeper, depth limit 8); ACP covers the active session only and reports subagent
+visibility as unknown; no message in flight to this builder (one at a time); not paused (a paused builder takes
 only the owner's messages); free resources if the message asked for them. Messages from the owner go first.
 A queue blocked for `stall_alert` (600 s) raises one `DISPATCH_STALLED` ACTION event saying why.
 
@@ -83,7 +84,7 @@ A queue blocked for `stall_alert` (600 s) raises one `DISPATCH_STALLED` ACTION e
 - **Agent Client Protocol** (`builder add NAME --acp "opencode acp" --directory DIR`; any ACP agent: OpenCode,
   Gemini CLI, Claude Code or Codex through their ACP adapters): Imperium starts the agent as its own child process,
   opens a session in the directory with the builder's MCP tool, and restarts the agent if it exits. The agent's
-  first turn activity after a prompt (a message, thought, plan or tool call) or its answer to the prompt is proof
+  first matching-session turn activity after a prompt (a message, thought, plan or tool call) or its answer to the prompt is proof
   of delivery and of the run; updates that can arrive at any time (commands, modes, usage) are not. An error answer
   before any activity is REJECTED. After a restart an agent that can load sessions replays its history, and
   Imperium's own header in it is proof (FOUND_LATE); an agent that cannot load or resume gets a new session and
@@ -108,16 +109,18 @@ PENDING → OPEN → CLAIMED_READY | CLAIMED_INCOMPLETE → VERIFIED → ACCEPTE
   round is OPEN again and VERIFIED is voided.
 - **Verification** (asynchronous): holding the builder's reservation, snapshot the code (**candidate**), then for
   every check that applies:
-  1. compare each file the check depends on with the hash recorded when the check was defined: a difference makes
-     the round's checks **untrusted** (ACTION) and VERIFIED impossible until the *owner* approves the new versions;
-  2. run it in a fresh copy of the snapshot (never in the live workspace), argv only, no shell, a minimal
-     environment plus the check's allow-list, with its timeout. Output goes to a file, so a leftover process
-     cannot hold the check open. On Windows the check runs in a job object that kills everything it started
-     when it ends, also detached processes; on Linux and macOS its process group is killed, and a process that
-     started its own session escapes (run checks in a container if that matters);
-  3. if `must_fail_on_base`, run it on the base too: passing there means it does not test the change;
-  4. record provenance: check id and version, argv, resolved executable and its hash, environment names and value
-     hashes, snapshot tree, exit code, duration, output hash, the redacted output file.
+  1. compare each file the check depends on with its recorded hash: any difference makes the round's checks
+     **untrusted** (ACTION) and ends the job **before any check executes**, until the owner approves the versions;
+  2. run each check in a fresh restricted Linux container from an owner-pinned image, with bounded resources,
+     no network, no credentials, read-only inputs and a disposable writable snapshot copy. Output is capped at
+     1 MB. Timeouts, cancellation, output exhaustion and container failures are execution errors. There is no
+     host fallback; the explicitly selected `unsafe-local` backend is not a security boundary and is forbidden
+     in isolation mode. See [VERIFICATION.md](VERIFICATION.md) for image setup and trust limits;
+  3. if `must_fail_on_base`, run it on the base too: require `base_failure_codes` (default `[1]`), with no execution
+     error or timeout. Passing, missing commands/directories, signals and container/setup failures do not discriminate;
+  4. record provenance: check id/version, argv, environment names/value hashes, snapshot tree, exit code,
+     duration, output hash and redacted output file. Container runs record the immutable image ID and Docker
+     client hash; unsafe-local runs record the resolved host executable and its hash.
   Changed test files are flagged (`TEST_FILES_CHANGED`).
 - **Objective.** A principal records `met` or `not met` for the current generation. VERIFIED needs it.
 - **Voiding.** Evidence stands only for what it covered. Requesting verification again, or defining a check (or a
@@ -223,3 +226,21 @@ swapped in one rename), and starts observe-only until the owner confirms.
 
 Questions from ACP agents (elicitation); pulling
 work instead of pushing it (needs a fetch that also claims); dashboard actions.
+
+
+## 11. Reliability-review policy update
+
+The runner and capability details in [VERIFICATION.md](VERIFICATION.md) and [ADAPTERS.md](ADAPTERS.md) supersede
+older host-runner descriptions above. Dependency mismatch now refuses the entire verification before executing
+anything. Docker is the default, with no fallback; `unsafe-local` is an explicit trusted-development exception
+and is forbidden with isolation mode. Container execution records image identity and command provenance, rather
+than attributing the host Docker binary's hash to the candidate executable.
+
+`stop-all` pauses dispatch; `abort-all` additionally queues durable per-builder cancellation requests and cancels
+verification jobs. Status distinguishes request, acknowledgement, confirmation, observed idle and uncertainty.
+No global process-kill guarantee is made. Cancellation interrupted by daemon restart becomes uncertain.
+
+Adapter polling uses bounded independent workers, with only one poll per builder. The poll interval is not a
+maximum latency bound. ACP progress updates advance a monotonic counter; non-turn or other-session notifications
+do not. Unknown subagent visibility remains unknown. Evidence from unfinished rounds verified before schema 8
+is invalidated on migration, while historical terminal decisions remain intact.

@@ -260,6 +260,23 @@ SCHEMA = [
     """
     ALTER TABLE outbox ADD COLUMN needs_resources INTEGER NOT NULL DEFAULT 0;
     """,
+    # version 8: explicit baseline outcomes, execution provenance, durable abort requests
+    """
+    ALTER TABLE checks ADD COLUMN base_failure_codes TEXT NOT NULL DEFAULT '[1]';
+    ALTER TABLE check_runs ADD COLUMN execution TEXT NOT NULL DEFAULT '{}';
+    INSERT INTO meta(key,value) SELECT 'verification_policy_upgrade_pending','1' FROM rounds
+        WHERE state NOT IN ('ACCEPTED','REJECTED','ABANDONED') AND
+        (checks_ok_generation IS NOT NULL OR verify_job IS NOT NULL) LIMIT 1;
+    UPDATE rounds SET state=CASE WHEN state='VERIFIED' THEN 'CLAIMED_READY' ELSE state END,
+        checks_ok_generation=NULL, verify_job=NULL WHERE state NOT IN ('ACCEPTED','REJECTED','ABANDONED');
+    CREATE TABLE cancellations(
+        builder TEXT PRIMARY KEY,
+        request_id TEXT NOT NULL,
+        state TEXT NOT NULL,
+        detail TEXT NOT NULL,
+        updated REAL NOT NULL
+    );
+    """,
 ]
 
 

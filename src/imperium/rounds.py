@@ -439,12 +439,12 @@ def decide(conn, rid, decision, principal, note, now, workspace_tree=None, overr
 # --- trusted checks ----------------------------------------------------------------------------------------
 
 CHECK_FIELDS = ("id", "version", "scope", "argv", "working_dir", "env", "timeout", "must_fail_on_base", "depends",
-                "required", "active", "created_by", "created")
+                "required", "active", "created_by", "created", "base_failure_codes")
 
 
 def _check_row(r):
     out = {k: r[k] for k in CHECK_FIELDS}
-    for k in ("argv", "env", "depends"):
+    for k in ("argv", "env", "depends", "base_failure_codes"):
         out[k] = json.loads(out[k])
     out["must_fail_on_base"], out["required"], out["active"] = (bool(out["must_fail_on_base"]),
                                                                bool(out["required"]), bool(out["active"]))
@@ -475,13 +475,18 @@ def check_list(conn, scope=None):
 
 
 def define_check(conn, *, cid, scope, argv, working_dir, env, timeout, must_fail_on_base, depends, required,
-                 principal):
+                 principal, base_failure_codes=None):
     """A new check (owner or director), or a new version of one (owner only). `depends` maps each path to the
     hash it had when the check was defined; verification refuses VERIFIED if any of them changed [D5]."""
     if not CHECK_ID.match(cid or ""):
         raise RoundError("a check id is 1-64 characters: lowercase letters, digits, '.', '-', '_'")
     if not isinstance(argv, list) or not argv or not all(isinstance(a, str) and a for a in argv):
         raise RoundError("argv must be a non-empty list of strings (no shell string)")
+    codes = [1] if base_failure_codes is None else base_failure_codes
+    if (not isinstance(codes, list) or not codes or
+            any(type(code) is not int or not 1 <= code <= 124 for code in codes)):
+        raise RoundError("base_failure_codes must be non-empty exit codes between 1 and 124; default [1]")
+    codes = sorted(set(codes))
     if not (0 < float(timeout) <= 6 * 3600):
         raise RoundError("timeout must be between 0 and 6 hours")
     if not isinstance(env, list) or not all(isinstance(e, str) and re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", e)
@@ -498,14 +503,14 @@ def define_check(conn, *, cid, scope, argv, working_dir, env, timeout, must_fail
         raise PermissionError("only the owner can change an existing check (S4 review D5)")
     version = (old or 0) + 1
     conn.execute("INSERT INTO checks(id, version, scope, argv, working_dir, env, timeout, must_fail_on_base, depends, "
-                 "required, active, created_by, created) VALUES(?,?,?,?,?,?,?,?,?,?,1,?,?)",
+                 "required, active, created_by, created, base_failure_codes) VALUES(?,?,?,?,?,?,?,?,?,?,1,?,?,?)",
                  (cid, version, scope, json.dumps(argv), wd, json.dumps(sorted(set(env))), float(timeout),
                   1 if must_fail_on_base else 0, json.dumps(depends, sort_keys=True), 1 if required else 0,
-                  principal, journal.now()))
+                  principal, journal.now(), json.dumps(codes)))
     journal.append(conn, "CHECK_DEFINED", "NOTICE", caller=principal,
                    data={"check": cid, "version": version, "scope": scope, "argv": argv, "working_dir": wd,
                          "env": sorted(set(env)), "must_fail_on_base": bool(must_fail_on_base),
-                         "depends": depends, "required": bool(required)})
+                         "depends": depends, "required": bool(required), "base_failure_codes": codes})
     # results from before this check existed do not cover it
     void_for_scope(conn, scope, journal.now(), f"check {cid} v{version} was defined; verify again", principal)
     return check_get(conn, cid)
@@ -520,15 +525,18 @@ def retire_check(conn, cid, principal):
 def record_run(conn, *, rid, generation, check, target, commit, tree, result, now):
     conn.execute("INSERT INTO check_runs(round, generation, check_id, check_version, target, commit_id, tree, "
                  "exit_code, timed_out, duration, output_sha256, output_path, executable, executable_sha256, "
-                 "env_names, created) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                 "env_names, created, execution) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                  (rid, generation, check["id"], check["version"], target, commit, tree, result["exit_code"],
                   1 if result["timed_out"] else 0, result["duration"], result["output_sha256"],
                   result["output_path"], result["executable"], result["executable_sha256"],
-                  json.dumps(result["env_names"]), now))
+                  json.dumps(result["env_names"]), now, json.dumps(result.get("execution", {}))))
 
 
 def runs(conn, rid):
-    return [dict(r) for r in conn.execute("SELECT * FROM check_runs WHERE round=? ORDER BY id", (rid,))]
+    rows = [dict(r) for r in conn.execute("SELECT * FROM check_runs WHERE round=? ORDER BY id", (rid,))]
+    for r in rows:
+        r["execution"] = json.loads(r["execution"])
+    return rows
 
 
 def claims(conn, rid):

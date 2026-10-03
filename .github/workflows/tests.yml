@@ -36,3 +36,25 @@ jobs:
         if: failure()
         shell: bash
         run: python tests/ci_annotate.py test-output.txt
+
+  container-verification:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
+        with:
+          python-version: '3.13'
+      - name: Prepare test image and record its immutable ID
+        shell: bash
+        run: |
+          docker pull python:3.13-slim
+          image_id=$(docker image inspect python:3.13-slim --format '{{.Id}}')
+          echo "IMPERIUM_TEST_IMAGE=$image_id" >> "$GITHUB_ENV"
+          echo "Verification test image: $image_id"
+      - name: Exercise the actual container boundary
+        env:
+          PYTHONPATH: src:tests
+        run: python -m unittest test_container_verification -v

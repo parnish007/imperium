@@ -27,7 +27,8 @@ uv tool install .        # or: pip install .
 imperium --version
 ```
 
-Imperium has no dependencies outside Python's standard library and needs no account or cloud service.
+The control service uses Python's standard library. Verification requires a local Docker engine with Linux
+containers and a prepared image; coding agents may require their own provider accounts.
 
 ## 2. Set it up once
 
@@ -41,6 +42,11 @@ imperium status     # what is running, what needs you
 To keep Imperium's files somewhere else, set `IMPERIUM_HOME` or pass `--home <dir>` to every command.
 `imperium down` stops the service; your data stays.
 
+Before verifying work, prepare an image containing `python3` and your test dependencies. Record its immutable
+image ID and configure `[verification] image` in `imperium.toml`, then restart the service. Checks run in
+restricted containers by default, with no host fallback. Follow [the runner setup guide](docs/VERIFICATION.md).
+The `python:3.13-slim` example supports standard-library tests; install pytest in your image for the examples below.
+
 ## 3. Connect a coding agent
 
 ### Option A: an agent Imperium starts itself (Agent Client Protocol)
@@ -52,8 +58,8 @@ imperium builder add coding --acp "opencode acp" --directory /path/to/your/repo
 ```
 
 `--acp` takes the command that starts the agent in ACP mode, as a string or a JSON list (use a JSON list when a
-path contains spaces). Any ACP agent works: OpenCode, Gemini CLI, or Claude Code and Codex through their ACP
-adapters; see each agent's documentation for its ACP command. Stopping Imperium stops the agents it started.
+path contains spaces). Start with the demonstrated OpenCode adapter. Gemini CLI and Claude Code/Codex ACP adapters are compatibility
+targets, not validated integrations; see the [adapter matrix](docs/ADAPTERS.md). Stopping Imperium stops the agents it started.
 
 ### Option B: an OpenCode server you run
 
@@ -84,12 +90,13 @@ imperium check add unit --builder coding \
     -- python -m pytest -q tests/test_calc.py
 ```
 
-- `--must-fail-on-base`: the check must fail on the code as it was before the round. A check that passes either
+- `--must-fail-on-base`: the check must finish with its assertion-failure code on the base (default 1;
+  use `--base-failure-code` for another documented code). Execution errors and timeouts do not count. A check that passes either
   way does not test the change.
 - `--depends`: files the check relies on. If the builder edits one, the check stops being trusted until you
   approve the new version (`imperium check approve unit`).
 - `--dir` runs it in a subdirectory; `--env NAME` passes an environment variable through (the environment is
-  otherwise minimal); `--optional` reports a check without requiring it to pass.
+  image-defined; names also need the owner's verification allow-list); `--optional` reports a check without requiring it to pass.
 
 ### 4.2 Open the round
 
@@ -121,8 +128,8 @@ imperium round objective <round> met           # or: not-met, with --note "why"
 imperium round accept <round>                  # or: reject, or abandon
 ```
 
-Verification passes only when every check passes on the builder's code and each `--must-fail-on-base` check fails
-on the original code. After you record the objective as met, the round is `VERIFIED`. Accepting is refused if the
+Verification passes only when every check passes on the builder's code and each `--must-fail-on-base` check finishes with an allowed assertion-failure code
+on the original code. No run may have an execution error. After you record the objective as met, the round is `VERIFIED`. Accepting is refused if the
 workspace changed since the verified snapshot.
 
 To ask for a fix within the same round: `imperium round message <round> --message "..."`. That starts a new
@@ -216,9 +223,12 @@ For a terminal that prints new events as they arrive: `imperium watch`.
 
 ## 9. Safety tools
 
-- **Stop everything**: `imperium stop-all --reason "..."`. Nothing new is sent to any builder. When you (the
+- **Pause dispatch**: `imperium stop-all --reason "..."`. Nothing new is sent to any builder. When you (the
   owner) pull it, open permission requests are also held and the director must claim again later. Work already
   running inside an agent is not interrupted. Release with `imperium resume-all`.
+- **Cancel active work**: `imperium abort-all --reason "..."` also pauses dispatch, cancels verification and requests
+  agent cancellation. Read `imperium status --json` for each outcome. A lost response is uncertain; detached
+  processes may survive. Only the owner resumes, after inspecting uncertain outcomes.
 - **Pause one builder**: `imperium builder pause coding` (only your own messages reach it);
   `imperium builder resume coding`.
 - **Integrity**: `imperium verify-journal` checks the journal's hash chain. If a check fails while running,

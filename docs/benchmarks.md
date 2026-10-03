@@ -1,8 +1,9 @@
 # Benchmarks
 
-Only measured numbers are published here, each with how to reproduce it. Nothing below compares Imperium's
-numbers with another tool's: the other tools were not run (see the end of this page for why), so the comparison is
-a feature table with sources, not a measurement.
+These are historical measurements from the original implementation, not a measurement of the revised concurrent
+scheduler or container verification runner. They have not been rerun for this change. The fake-server harness
+measures delivery accounting, not coding success, reliability across real tasks, or comparative productivity.
+See [VALIDATION.md](VALIDATION.md) for current regression coverage and the real-task evaluation still required.
 
 ## Delivery under random faults
 
@@ -32,7 +33,7 @@ Reproduce: `PYTHONPATH=src:tests python bench/delivery.py --messages 300 --seed 
 ## Time from a permission ask to the director's feed
 
 Measured in the same harness (20 samples per run, two runs): median 31 ms and 64 ms, maximum 95 ms, for one poll cycle plus one feed read.
-In service, add up to one poll interval (2 s by default, `[opencode] poll_interval`).
+In service, latency also includes adapter requests and worker availability. A poll interval alone is not an upper bound.
 
 ## Footprint
 
@@ -59,16 +60,8 @@ and a test had to fail. Of 120 such bugs, 115 were caught; each of the other 5 i
 still holds (for example, a check repeated at the API route). Where a mutation first survived, a test was added.
 The suite runs on Windows, Linux and macOS with Python 3.11 and 3.13.
 
-## Other tools: features, from their source or documentation
+## Comparative evidence
 
-Not measured. They were read, not run: they need tmux (not native on Windows) or a desktop install, and running
-them on this machine needs the owner's approval for each install.
-
-| | Message delivery | What counts as done | Platforms | Source read |
-|---|---|---|---|---|
-| **Imperium** | durable outbox; proof by the message's own id; uncertain outcomes wait for a decision | trusted checks on a code snapshot, then a named principal's acceptance | Windows, Linux, macOS | — |
-| Agent Deck | durable at-most-once outbox, reconciled against the transcript; typed into tmux panes | a rule in the conductor's prompt (`GATES`, `VERDICT.md`), not enforced by the tool | macOS, Linux, WSL | source |
-| Gas City | work items pulled from a store; the wake-up nudge is fire-and-forget | the agent closes the work item | tmux platforms | source |
-| Agent Orchestrator | workers in their own branch and worktree, ~25 agent adapters | pull request, CI and review facts | macOS, Windows, Linux | README, directory listing |
-| Beads | not a supervisor: a work graph | `bd close` by the agent | many | README |
-| Claude Squad | tmux sessions with worktrees | the human reviews the diff | tmux platforms | README |
+No competing supervisor was run in these measurements. There is no evidence here for a comparative productivity
+or reliability advantage. Feature comparisons require versioned primary sources and a shared evaluation setup;
+the previous unversioned comparison table has been removed.

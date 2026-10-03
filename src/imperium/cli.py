@@ -7,6 +7,7 @@ import datetime
 import json
 import os
 import secrets
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -46,7 +47,7 @@ class _Parser(argparse.ArgumentParser):
 
 
 def _parser(err):
-    p = _Parser(prog="imperium", description="Imperium: deliver prompts exactly once, record every event, "
+    p = _Parser(prog="imperium", description="Imperium: record delivery evidence, expose uncertain outcomes, "
                 "verify builders' claims.", err=err)
     p.add_argument("--home", help="runtime directory (default: IMPERIUM_HOME or ~/.imperium)")
     p.add_argument("--json", action="store_true", help="machine-readable output")
@@ -197,6 +198,8 @@ def _parser(err):
     ca.add_argument("--timeout", type=float, default=1800)
     ca.add_argument("--must-fail-on-base", action="store_true",
                     help="it must fail on the code before the round, or it does not test the change")
+    ca.add_argument('--base-failure-code', type=int, action='append',
+                    help='expected test-failure exit code on base (repeatable, default: 1; never timeout/setup error)')
     ca.add_argument("--depends", action="append", default=[],
                     help="a file the check relies on (test, script); a change to it makes the check untrusted")
     ca.add_argument("--optional", action="store_true", help="report it, but do not require it to pass")
@@ -260,6 +263,8 @@ def _parser(err):
     ex.add_argument("--out", required=True)
     sa = add("stop-all", "send nothing to any builder until the owner resumes")
     sa.add_argument("--reason")
+    ab = add('abort-all', 'pause dispatch and request active-turn and verification cancellation; inspect status')
+    ab.add_argument('--reason')
     add("resume-all", "end stop-all (owner)")
     dr = add("director", "register the Claude Code session that directs builders")
     dsub = dr.add_subparsers(dest="director_cmd", parser_class=_Parser)
@@ -701,6 +706,7 @@ def cmd_check(ctx):
         return _owner_or_refuse(ctx).call("POST", "/v1/checks/retire", {"id": a.id})
     body = {"id": a.id, "argv": a.argv, "working_dir": a.dir, "env": a.env, "timeout": a.timeout,
             "must_fail_on_base": a.must_fail_on_base, "depends": a.depends, "required": not a.optional}
+    body['base_failure_codes'] = a.base_failure_code or [1]
     body["builder" if a.builder else "round"] = a.builder or a.round
     return _client(ctx).call("POST", "/v1/checks", body, timeout=60)
 
@@ -911,6 +917,10 @@ def cmd_stop_all(ctx):
     return _client(ctx).call("POST", "/v1/stop-all", body)
 
 
+def cmd_abort_all(ctx):
+    return _client(ctx).call('POST', '/v1/abort-all', {'reason': ctx['args'].reason or 'abort requested'})
+
+
 def cmd_resume_all(ctx):
     return _owner_or_refuse(ctx).call("POST", "/v1/resume-all", {})
 
@@ -959,8 +969,18 @@ def cmd_doctor(ctx):
     check("home private", *paths.check_private(home))
     check("home local", *paths.check_local(home))
     try:
-        config.load(home)
+        cfg = config.load(home)
         check("config", "OK", paths.config(home))
+        from . import check_runner
+        vc = cfg['verification']
+        if vc['backend'] == 'unsafe-local':
+            check('verification', 'WARN', 'unsafe-local executes candidate code as your account')
+        elif not check_runner.PIN.fullmatch(vc['image']):
+            check('verification', 'WARN', 'checks disabled until verification.image is pinned; see docs/VERIFICATION.md')
+        elif not shutil.which('docker'):
+            check('verification', 'WARN', 'Docker is not installed; checks are disabled, no host fallback')
+        else:
+            check('verification', 'OK', 'Docker configured; image and runtime are checked before execution')
     except config.ConfigError as e:
         check("config", "FAIL", str(e))
     conn = None
@@ -1016,6 +1036,7 @@ COMMANDS = {
     "backup": cmd_backup, "restore": cmd_restore, "restore-confirm": cmd_restore_confirm, "token": cmd_token,
     "builder": cmd_builder, "director": cmd_director, "quarantine": cmd_quarantine,
     "send": cmd_send, "queue": cmd_queue, "msg": cmd_msg, "stop-all": cmd_stop_all, "resume-all": cmd_resume_all,
+    'abort-all': cmd_abort_all,
     "round": cmd_round, "check": cmd_check, "builder-mcp": cmd_builder_mcp, "approvals": cmd_approvals,
     "approve": cmd_approve, "deny": cmd_deny, "rule": cmd_rule, "questions": cmd_questions, "answer": cmd_answer,
     "watch": cmd_watch, "mcp": cmd_mcp, "hook": cmd_hook, "plugin": cmd_plugin, "dashboard": cmd_dashboard,

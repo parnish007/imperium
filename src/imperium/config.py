@@ -1,5 +1,6 @@
 """`imperium.toml`: schema-validated; unknown keys are rejected (DESIGN §12)."""
 import os
+import math
 import tomllib
 
 from . import paths
@@ -12,6 +13,7 @@ SCHEMA = {
         "max_body": (int, 262_144),  # bytes
     },
     "opencode": {
+        "max_workers": (int, 4),  # bounded adapter I/O concurrency; never two polls for one builder
         "poll_interval": (float, 2.0),  # seconds between polls of each builder
         "timeout": (float, 10.0),  # seconds per HTTP request to OpenCode
         "page_size": (int, 50),  # messages per history page
@@ -41,6 +43,15 @@ SCHEMA = {
         "owner_accounts": (list, []),
         "builder_accounts": (list, []),
     },
+    "verification": {
+        "backend": (str, "docker"),  # docker or explicitly unsafe-local; never falls back
+        "image": (str, ""),  # locally installed Linux image, pinned by sha256 digest
+        "memory_mb": (int, 1024),
+        "cpus": (float, 2.0),
+        "pids_limit": (int, 128),
+        "writable_mb": (int, 256),
+        "env_allowlist": (list, []),  # host values checks may explicitly request
+    },
     "notify": {
         # A command (argv list) run for every event at or above `floor`, with the event as JSON on stdin.
         "command": (list, []),
@@ -56,7 +67,7 @@ SCHEMA = {
 }
 
 DEFAULT_TEXT = """\
-# Imperium configuration. Unknown keys are rejected; see DESIGN.md.
+# Imperium configuration. Unknown keys are rejected; see docs/SPEC.md.
 
 [daemon]
 # Requests per second allowed per principal on the local API, and the burst above that rate.
@@ -68,6 +79,7 @@ audit_cap = 100000
 max_body = 262144
 
 [opencode]
+max_workers = 4
 # Seconds between polls of each builder, and per request.
 poll_interval = 2.0
 timeout = 10.0
@@ -107,6 +119,17 @@ min_free_gb = 3.0
 [integrity]
 # Seconds between journal chain checks while running (a break quarantines Imperium).
 verify_interval = 300.0
+
+[verification]
+# Install Docker and pin a Linux image containing python3 and your test dependencies.
+# See docs/VERIFICATION.md. Missing configuration refuses checks; it never executes on the host.
+backend = "docker"
+image = ""
+memory_mb = 1024
+cpus = 2.0
+pids_limit = 128
+writable_mb = 256
+env_allowlist = []
 
 [redaction]
 # Environment variables whose values are removed from builder text (values are never stored).
@@ -154,10 +177,24 @@ def load(home):
                 continue
             if typ is float and isinstance(v, int) and not isinstance(v, bool):
                 v = float(v)
-            if not isinstance(v, typ) or isinstance(v, bool) or v <= 0:
+            if typ is str:
+                if not isinstance(v, str):
+                    problems.append(f"{sec}.{k} must be a string")
+                else:
+                    cfg[sec][k] = v
+                continue
+            if not isinstance(v, typ) or isinstance(v, bool) or v <= 0 or not math.isfinite(v):
                 problems.append(f"{sec}.{k} must be a positive {typ.__name__}")
                 continue
             cfg[sec][k] = v
+    if not 2 <= cfg["opencode"]["max_workers"] <= 32:
+        problems.append("opencode.max_workers must be between 2 and 32")
+    if cfg["verification"]["backend"] not in ("docker", "unsafe-local"):
+        problems.append("verification.backend must be docker or unsafe-local")
+    if cfg["isolation"]["owner_accounts"] and cfg["verification"]["backend"] == "unsafe-local":
+        problems.append("isolation mode refuses the unsafe-local verification backend")
+    if cfg["notify"]["floor"] not in ("ACTION", "CRITICAL"):
+        problems.append("notify.floor must be ACTION or CRITICAL")
     if problems:
         raise ConfigError(f"{path}: " + "; ".join(problems))
     return cfg

@@ -108,6 +108,13 @@ def prompt(st, mid, p):
     s = st["sessions"][sid]
     s["history"].append(["user", text])
     save(st)
+    if 'WAIT_CANCEL' in text:
+        update(sid, {'sessionUpdate': 'agent_message_chunk', 'content': {'type': 'text', 'text': 'working'}})
+        while True:
+            request = read()
+            if request.get('method') == 'session/cancel' and request.get('params', {}).get('sessionId') == sid:
+                send({'jsonrpc': '2.0', 'id': mid, 'result': {'stopReason': 'cancelled'}})
+                return
     if "SLOW" in text:
         time.sleep(1.5)
     words = text.split()
