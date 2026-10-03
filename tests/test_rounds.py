@@ -17,7 +17,8 @@ from imperium import cli, client, mcp, snapshot
 
 SID = "ses_r1"
 CONFIG = ("[opencode]\npoll_interval = 3600.0\n"
-          "[delivery]\nidle_stable_polls = 1\nreconcile_window = 60.0\nadmit_timeout = 120.0\n")
+          "[delivery]\nidle_stable_polls = 1\nreconcile_window = 60.0\nadmit_timeout = 120.0\n"
+          "[verification]\nbackend = 'unsafe-local'\n")
 PY = sys.executable
 TEST_SCRIPT = "import sys\nsys.path.insert(0, '.')\nfrom calc import add\nsys.exit(0 if add(2, 3) == 5 else 1)\n"
 

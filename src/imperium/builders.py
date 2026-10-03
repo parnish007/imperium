@@ -83,6 +83,10 @@ def remove(conn, name, caller="owner"):
     if live:
         raise Conflict(f"builder {name!r} has {live} message(s) queued or in flight; cancel or settle them first "
                        "(`imperium queue {name}`)")
+    cancelling = conn.execute("SELECT 1 FROM cancellations WHERE builder=? AND state IN "
+                              "('pending','sending','requested','acknowledged')", (name,)).fetchone()
+    if cancelling:
+        raise Conflict('builder cancellation is still in progress; inspect status before removing it')
     conn.execute("DELETE FROM builders WHERE name=?", (name,))
     conn.execute("DELETE FROM checkpoints WHERE builder=?", (name,))
     journal.append(conn, "BUILDER_REMOVED", "NOTICE", builder=name, caller=caller)

@@ -12,7 +12,8 @@ from imperium import acp, cli, client
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 CONFIG = ("[opencode]\npoll_interval = 3600.0\n"
-          "[delivery]\nidle_stable_polls = 1\nreconcile_window = 60.0\nadmit_timeout = 120.0\n")
+          "[delivery]\nidle_stable_polls = 1\nreconcile_window = 60.0\nadmit_timeout = 120.0\n"
+          "[verification]\nbackend = 'unsafe-local'\n")
 
 
 def run(home, *args, env=None):
@@ -81,6 +82,14 @@ class Base(unittest.TestCase):
 
 
 class TestAcp(Base):
+    def test_abort_all_cancels_active_turn_and_reports_confirmation(self):
+        self.send('WAIT_CANCEL', 'cancel-me')
+        self.until(lambda: self.cp().get('status') == 'busy')
+        self.c.call('POST', '/v1/abort-all', {})
+        self.until(lambda: self.c.call('GET', '/v1/status')['cancellations'][0]['state'] == 'confirmed')
+        self.assertEqual(self.cp()['status'], 'idle')
+        self.c.call('POST', '/v1/resume-all', {})
+
     def test_session_is_created_with_the_builder_tool_and_recorded(self):
         b = self.builder()
         self.assertTrue(b["session_id"].startswith("sess_"))

@@ -29,76 +29,101 @@ class VerifyError(RuntimeError):
     pass
 
 
-def run_check(argv, cwd, env_names, timeout, out_path, secrets=()):
-    """Run one check. Returns provenance; never raises for the check's own failure."""
-    env = {k: v for k, v in os.environ.items() if k.upper() in BASE_ENV or k in env_names}
-    if os.path.dirname(argv[0]):  # a path ("./run.sh", "tools/check"): relative to the check's directory
+def run_check(argv, cwd, env_names, timeout, out_path, secrets=(), *, cancel=None, environment=None):
+    """Unsafe host runner, also used to supervise the Docker client (never candidate code in Docker mode).
+
+    Output is drained with a hard byte limit. Cancellation, timeout and output exhaustion are execution errors,
+    never evidence that a baseline assertion failed. Callers must explicitly choose this backend.
+    """
+    env = (dict(environment) if environment is not None else
+           {k: v for k, v in os.environ.items() if k.upper() in BASE_ENV or k in env_names})
+    if os.path.dirname(argv[0]):
         exe = argv[0] if os.path.isabs(argv[0]) else os.path.normpath(os.path.join(cwd, argv[0]))
     else:
         exe = shutil.which(argv[0], path=env.get("PATH") or env.get("Path")) or argv[0]
-    exe_hash = None
     try:
         with open(exe, "rb") as f:
             exe_hash = hashlib.file_digest(f, "sha256").hexdigest()
     except OSError:
-        pass
-    kw = {}
-    if os.name == "nt":
-        kw["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
-    else:
-        kw["start_new_session"] = True
+        exe_hash = None
+    kw = ({"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP} if os.name == "nt" else
+          {"start_new_session": True})
     started = time.monotonic()
-    timed_out, survivors = False, False
-    os.makedirs(os.path.dirname(out_path), exist_ok=True)
-    raw_path = out_path + ".raw"
-    # Output goes to a file, not a pipe: a process the check leaves behind cannot keep the read open, and every
-    # wait below has a bound (S5 review C12).
-    with open(raw_path, "wb") as raw_f:
+    error, timed_out, code = None, False, None
+    output = bytearray()
+    limit = threading.Event()
+    cancel = cancel or threading.Event()
+    p = None
+    if cancel.is_set():
+        error = "cancelled"
+    else:
         try:
-            p = subprocess.Popen([exe] + list(argv[1:]), cwd=cwd, env=env, stdout=raw_f, stderr=subprocess.STDOUT,
-                                 stdin=subprocess.DEVNULL, **kw)
+            p = subprocess.Popen([exe] + list(argv[1:]), cwd=cwd, env=env, stdout=subprocess.PIPE,
+                                 stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, **kw)
         except OSError as e:
-            raw_f.write(f"could not start {argv[0]}: {e}".encode())
-            p, code = None, None
-        if p is not None:
-            job = _Job.attach(p)
+            error = "start_failed"
+            output.extend(str(e).encode()[:OUTPUT_CAP])
+    if p is not None:
+        def drain():
             try:
-                p.wait(timeout=timeout)
-            except subprocess.TimeoutExpired:
-                timed_out = True
-                _kill_tree(p)
+                while True:
+                    chunk = p.stdout.read(8192)
+                    if not chunk:
+                        break
+                    remaining = OUTPUT_CAP - len(output)
+                    output.extend(chunk[:remaining])
+                    if len(chunk) > remaining:
+                        limit.set()
+                        break
+            except (OSError, ValueError):
+                pass
+
+        reader = threading.Thread(target=drain, daemon=True, name="imperium-check-output")
+        reader.start()
+        job = _Job.attach(p)
+        try:
+            while p.poll() is None:
+                if cancel.is_set() or limit.is_set() or time.monotonic() - started >= timeout:
+                    error = "cancelled" if cancel.is_set() else "output_limit" if limit.is_set() else "timeout"
+                    timed_out = error == "timeout"
+                    _kill_tree(p)
+                    break
+                cancel.wait(0.02)
             if job:
-                job.close()  # kills every process still in the job, including ones that detached
+                job.close()
             elif os.name != "nt":
-                try:  # what is left in the check's session; a process that started its own session escapes
+                try:
                     os.killpg(p.pid, signal.SIGKILL)
                 except OSError:
                     pass
             try:
-                p.wait(timeout=30)
+                p.wait(timeout=5)
             except subprocess.TimeoutExpired:
-                survivors = True
+                error = "cleanup_failed"
+            reader.join(2)
+            if reader.is_alive():
+                error = "output_pipe_open"
+            else:
+                p.stdout.close()
+            if limit.is_set():
+                error = error or "output_limit"
+            if cancel.is_set():
+                error = "cancelled"
             code = p.returncode
-    duration = time.monotonic() - started
-    h = hashlib.sha256()
-    with open(raw_path, "rb") as f:
-        head = f.read(OUTPUT_CAP + 1)
-        h.update(head)
-        for chunk in iter(lambda: f.read(1 << 20), b""):
-            h.update(chunk)
-        size = f.tell()
-    os.remove(raw_path)
-    digest = h.hexdigest()
-    text = head[:OUTPUT_CAP].decode("utf-8", "replace")
-    if size > OUTPUT_CAP:
-        text += f"\n[output cut at {OUTPUT_CAP} of {size} bytes]"
-    if survivors:
-        text += "\n[the check's process did not exit after it was killed]"
+        finally:
+            if job:
+                job.close()
+    data = bytes(output)
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
     with open(out_path, "w", encoding="utf-8") as f:
-        f.write(untrusted.redact(text, secrets))
-    return {"exit_code": code, "timed_out": timed_out, "duration": round(duration, 3), "output_sha256": digest,
-            "output_path": out_path, "executable": exe, "executable_sha256": exe_hash,
-            "env_names": sorted({k: hashlib.sha256(v.encode()).hexdigest()[:12] for k, v in env.items()}.items())}
+        f.write(untrusted.redact(data.decode("utf-8", "replace"), secrets))
+        if error:
+            f.write(f"\n[execution error: {error}]\n")
+    return {"exit_code": code, "timed_out": timed_out, "duration": round(time.monotonic() - started, 3),
+            "output_sha256": hashlib.sha256(data).hexdigest(), "output_path": out_path,
+            "executable": exe, "executable_sha256": exe_hash,
+            "env_names": sorted((k, hashlib.sha256(v.encode()).hexdigest()[:12]) for k, v in env.items()),
+            "execution": {"backend": "unsafe-local", "error": error, "output_bytes": len(data)}}
 
 
 class _Job:
@@ -187,6 +212,8 @@ def hash_depends(directory, paths, repo_relative=False):
             continue
         if top is None:
             top, prefix = snapshot.repo_root(directory)
+        if '..' in p.replace('\\', '/').split('/'):
+            raise VerifyError('relative check dependencies must stay inside the repository')
         rel = "/".join(x for x in ([] if repo_relative else [prefix]) + p.replace("\\", "/").split("/")
                        if x and x != ".")
         h = snapshot.hash_file(top, rel)
@@ -204,21 +231,32 @@ class Verifier:
         self.busy = 0
         self.thread = None
         self.stop_event = threading.Event()
+        self.cancel_event = threading.Event()
+        self.cancel_epoch = 0
 
     def start(self):
         self.thread = threading.Thread(target=self._loop, name="imperium-verify", daemon=True)
         self.thread.start()
 
     def stop(self):
+        self.abort_all()
         self.stop_event.set()
         self.q.put(None)
         if self.thread:
-            self.thread.join(5)
+            # Container inspection/removal has bounded RPC timeouts. Do not close SQLite while this worker
+            # is still recording the cancelled job or releasing its reservation.
+            self.thread.join()
 
     def submit(self, rid, job):
         with self.cond:
             self.busy += 1
-        self.q.put((rid, job))
+            self.q.put((rid, job, self.cancel_epoch))
+
+    def abort_all(self):
+        with self.cond:
+            self.cancel_epoch += 1
+            self.cancel_event.set()
+        return {"state": "requested", "note": "active and queued checks are cancelled; watch VERIFY_FAILED"}
 
     def wait_idle(self, timeout=60):
         end = time.monotonic() + timeout
@@ -235,9 +273,16 @@ class Verifier:
             item = self.q.get()
             if item is None:
                 return
-            rid, job = item
+            rid, job, epoch = item
             try:
-                self.run(rid, job)
+                with self.cond:
+                    cancelled = epoch != self.cancel_epoch
+                    if not cancelled:
+                        self.cancel_event = threading.Event()
+                if cancelled:
+                    self._finish(rid, job, error="verification cancelled before execution")
+                else:
+                    self.run(rid, job)
             except Exception:  # one failed job must not stop the worker
                 log.exception("verification of %s failed", rid)
                 self._finish(rid, job, error="internal error; see the daemon log")
@@ -305,6 +350,16 @@ class Verifier:
                     have = snapshot.blob(top, snap["commit"], path)
                 if have != want:
                     untrusted_checks.append({"check": c["id"], "path": path, "missing": have is None})
+        # Refuse before *any* check executes, including optional checks. A later rejection cannot undo effects.
+        if untrusted_checks:
+            with self.d.store.tx() as conn:
+                conn.execute("UPDATE rounds SET untrusted=1 WHERE id=?", (rid,))
+                journal.append(conn, "UNTRUSTED_CHECKS", "ACTION", builder=r["builder"],
+                               data={"round": rid, "generation": gen, "changed": untrusted_checks,
+                                     "note": "no checks executed; owner review and approval are required"})
+                journal.append(conn, "TEST_FILES_CHANGED", "ACTION", builder=r["builder"],
+                               data={"round": rid, "files": [x['path'] for x in untrusted_checks]})
+            return self._finish(rid, job, error="trusted check dependencies changed; no checks executed")
         # 2. test files changed in the round (a flag, never a block)
         if r["base_commit"]:
             changed = [p for _, p in snapshot.changed_files(top, r["base_commit"], snap["commit"])]
@@ -317,8 +372,11 @@ class Verifier:
         out_dir = os.path.join(self.d.home, "checks")
         results, failed = [], []
         for c in checks:
+            if self.cancel_event.is_set():
+                failed.append("verification cancelled")
+                break
             res = self._run_on(top, prefix, snap["commit"], c, out_dir, rid, gen, "candidate", secrets)
-            ok = res["exit_code"] == 0 and not res["timed_out"]
+            ok = res["exit_code"] == 0 and not res["timed_out"] and not res.get('execution', {}).get('error')
             entry = {"check": c["id"], "version": c["version"], "passed": ok, "exit_code": res["exit_code"],
                      "timed_out": res["timed_out"], "required": c["required"]}
             if c["must_fail_on_base"]:
@@ -328,13 +386,16 @@ class Verifier:
                         failed.append(f"{c['id']}: no base snapshot to show it fails without the change")
                 else:
                     base = self._run_on(top, prefix, r["base_commit"], c, out_dir, rid, gen, "base", secrets)
-                    entry["discriminating"] = base["exit_code"] != 0 or base["timed_out"]
+                    entry["discriminating"] = (base["exit_code"] in c['base_failure_codes'] and
+                                               not base["timed_out"] and
+                                               not base.get('execution', {}).get('error'))
                     if not entry["discriminating"]:
                         events.append(("GATE_NOT_DISCRIMINATING", "ACTION",
-                                       {"check": c["id"], "note": "it passes without the change, so it does not "
-                                                                   "test the change"}))
+                                       {"check": c["id"], "expected_codes": c['base_failure_codes'],
+                                        "exit_code": base['exit_code'], "execution": base.get('execution', {}),
+                                        "note": "baseline did not produce the configured test-failure outcome"}))
                         if c["required"]:
-                            failed.append(f"{c['id']}: passes on the base snapshot too")
+                            failed.append(f"{c['id']}: baseline did not produce the expected test failure")
             if not ok and c["required"]:
                 failed.append(f"{c['id']}: " + ("timed out" if res["timed_out"] else f"exit {res['exit_code']}"))
             results.append(entry)
@@ -344,20 +405,16 @@ class Verifier:
             # (S5 review C15, C3)
             if meta_get(conn, "quarantine"):
                 failed.append("Imperium is quarantined (journal integrity); results are not used")
+            if self.cancel_event.is_set():
+                failed.append("verification cancelled; results are not used")
             ran = sorted((c["id"], c["version"]) for c in checks)
             if ran != sorted((c["id"], c["version"]) for c in rounds.checks_for(conn, r["builder"], rid)):
                 failed.append("the checks changed while they were running; verify again")
             for type_, sev, data in events:
                 journal.append(conn, type_, sev, builder=r["builder"], data={"round": rid, "generation": gen, **data})
-            if untrusted_checks:
-                conn.execute("UPDATE rounds SET untrusted=1 WHERE id=?", (rid,))
-                journal.append(conn, "UNTRUSTED_CHECKS", "ACTION", builder=r["builder"],
-                               data={"round": rid, "generation": gen, "changed": untrusted_checks,
-                                     "note": "files the checks depend on changed; only the owner can approve the "
-                                             "new versions (`imperium check approve`)"})
             if not checks:
                 failed.append("no checks are defined for this round or builder")
-            if failed or untrusted_checks:
+            if failed:
                 journal.append(conn, "VERIFY_FAILED", "ACTION", builder=r["builder"],
                                data={"round": rid, "generation": gen, "failed": failed, "results": results})
             else:
@@ -372,17 +429,19 @@ class Verifier:
                 conn.execute("UPDATE rounds SET verify_job=NULL WHERE id=?", (rid,))
 
     def _run_on(self, top, prefix, commit, c, out_dir, rid, gen, target, secrets):
+        from . import check_runner
         clock = self.d.engine.clock
         with snapshot.Worktree(top, commit) as wt:
             cwd = os.path.normpath(os.path.join(wt, *[x for x in (prefix + "/" + c["working_dir"]).split("/")
                                                       if x and x != "."]))
             if not os.path.isdir(cwd):
-                res = {"exit_code": None, "timed_out": False, "duration": 0.0, "output_sha256": None,
-                       "output_path": None, "executable": None, "executable_sha256": None, "env_names": [],
-                       "error": f"working directory {c['working_dir']} is not in the snapshot"}
+                res = check_runner.failure('working directory is not in the snapshot',
+                                           self.d.cfg['verification']['backend'])
             else:
                 name = f"{rid}-g{gen}-{c['id']}-{target}-{int(time.time() * 1000)}.log"
-                res = run_check(c["argv"], cwd, set(c["env"]), c["timeout"], os.path.join(out_dir, name), secrets)
+                res = check_runner.run(self.d.cfg['verification'], bool(self.d.cfg['isolation']['owner_accounts']),
+                                       c['argv'], wt, cwd, set(c['env']), c['timeout'], os.path.join(out_dir, name),
+                                       c['depends'], secrets, cancel=self.cancel_event)
         with self.d.store.tx() as conn:
             rounds.record_run(conn, rid=rid, generation=gen, check=c, target=target, commit=commit,
                               tree=snapshot._git(["rev-parse", f"{commit}^{{tree}}"], top), result=res, now=clock())

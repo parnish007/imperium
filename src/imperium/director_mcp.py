@@ -105,6 +105,7 @@ def server(client):
                          "must_fail_on_base: it must fail on the code before the round.",
                          obj({"id": STR, "builder": STR, "round": STR, "argv": STRS, "working_dir": STR, "env": STRS,
                               "timeout": {"type": "number"}, "must_fail_on_base": BOOL, "depends": STRS,
+                              'base_failure_codes': {'type': 'array', 'items': INT},
                               "required": BOOL}, ["id", "argv"]),
                          lambda a: call("POST", "/v1/checks", a, timeout=60), ACT),
         "approvals": ("Permission asks waiting for a decision.", obj({"builder": STR}),
@@ -118,8 +119,12 @@ def server(client):
         "answer_question": ("Answer a builder's question: one list of chosen labels per question, or reject.",
                             obj({"id": STR, "answers": {"type": "array", "items": STRS}, "reject": BOOL}, ["id"]),
                             lambda a: call("POST", "/v1/questions/answer", a), DECIDE),
-        "stop_all": ("Emergency brake: nothing is sent to any builder until the owner resumes.",
+        "stop_all": ("Pause dispatch: no new prompts or allows; already running work continues. Use abort_all to "
+                     "request cancellation.",
                      obj({"reason": STR}), lambda a: call("POST", "/v1/stop-all", a), DECIDE),
+        'abort_all': ('Pause dispatch and request cancellation of active turns and checks. Inspect status for '
+                      'acknowledged, confirmed, or uncertain outcomes; detached processes may survive.',
+                      obj({'reason': STR}), lambda a: call('POST', '/v1/abort-all', a), DECIDE),
     }
     return mcp.Server("imperium", tools, instructions=(
         "Imperium: direct coding builders. Read the feed (events_since, then ack), open rounds with checkable "

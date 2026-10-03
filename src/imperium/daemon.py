@@ -125,6 +125,7 @@ def r_status(d, principal, body, query):
         approvals_open = conn.execute("SELECT COUNT(*) FROM approvals WHERE state IN ('PENDING','HELD')").fetchone()[0]
         questions_open = conn.execute("SELECT COUNT(*) FROM questions WHERE state='PENDING'").fetchone()[0]
         bl = []
+        cancellations = [dict(r) for r in conn.execute('SELECT * FROM cancellations ORDER BY builder')]
         stop_all = meta_get(conn, "stop_all")
         for b in builders.list_(conn):
             r = conn.execute("SELECT data FROM checkpoints WHERE builder=?", (b["name"],)).fetchone()
@@ -137,6 +138,8 @@ def r_status(d, principal, body, query):
                        "paused": bool(b["paused"]), "status": cp.get("status"),
                        "permissions_pending": cp.get("permissions"), "questions_pending": cp.get("questions"),
                        "busy_subagents": cp.get("busy_children"), "queued": queued,
+                       "readiness_scope": "session" if b['adapter'] == 'acp' else "session_and_observed_descendants",
+                       "subagent_visibility": "unavailable" if b['adapter'] == 'acp' else "observed",
                        "in_flight": outbox.holder(conn, b["name"]),
                        **(d.engine.state(b["name"]) if d.engine else {})})
     return {"run_id": d.run_id, "pid": d.pid, "port": d.port, "started": d.started, "version": __version__,
@@ -147,7 +150,8 @@ def r_status(d, principal, body, query):
             "observe_only": observe_only, "stop_all": stop_all, "quarantine": d.quarantine(), "consumers": consumers,
             "auto_answers_unreported": auto_unreported, "approvals_open": approvals_open,
             "questions_open": questions_open, "director_present": d.lease_ok()[0],
-            "needs_you": needs_you, "audit_dropped": dropped, "builders": bl}
+            "needs_you": needs_you, "audit_dropped": dropped, "builders": bl,
+            "cancellations": cancellations, "verification_backend": d.cfg['verification']['backend']}
 
 
 def r_builders(d, principal, body, query):
@@ -271,24 +275,48 @@ def r_builder_allow_version(d, principal, body, query):
         return {"builder": builders.allow_version(conn, str(_req(body, "name")), _req(body, "version"), principal)}
 
 
-def r_stop_all(d, principal, body, query):
-    """Nothing is sent to any builder until the owner resumes. Anyone may stop; only the owner resumes.
-    When the owner stops everything, open asks are held and director tokens are revoked (DESIGN §11.1): the
-    director claims again after `resume-all`."""
+def _pause_dispatch(conn, principal, body):
     reason = str(body.get("reason") or "stopped").strip()[:200]
-    with d.store.tx() as conn:
-        meta_set(conn, "stop_all", f"{reason} (by {principal})")
-        held = revoked = 0
-        if principal == "owner":
-            held = approvals.hold_all_pending(conn, principal)
-            revoked = conn.execute("UPDATE tokens SET revoked=? WHERE principal LIKE 'director:%' AND revoked IS NULL",
-                                   (journal.now(),)).rowcount
-            conn.execute("UPDATE directors SET released_at=? WHERE released_at IS NULL", (journal.now(),))
-        journal.append(conn, "STOP_ALL", "ACTION", caller=principal,
-                       data={"reason": reason, "approvals_held": held, "director_tokens_revoked": revoked,
-                             "effect": "no message is sent to any builder until `imperium resume-all`"})
-    d.leases.clear() if principal == "owner" else None
+    meta_set(conn, "stop_all", f"{reason} (by {principal})")
+    held = revoked = 0
+    if principal == "owner":
+        held = approvals.hold_all_pending(conn, principal)
+        revoked = conn.execute("UPDATE tokens SET revoked=? WHERE principal LIKE 'director:%' AND revoked IS NULL",
+                               (journal.now(),)).rowcount
+        conn.execute("UPDATE directors SET released_at=? WHERE released_at IS NULL", (journal.now(),))
+    journal.append(conn, "STOP_ALL", "ACTION", caller=principal,
+                   data={"reason": reason, "approvals_held": held, "director_tokens_revoked": revoked,
+                         "effect": "no new message is dispatched until `imperium resume-all`"})
     return {"stopped": True, "approvals_held": held, "director_tokens_revoked": revoked}
+
+
+def r_stop_all(d, principal, body, query):
+    """Pause dispatch; hold asks and revoke director tokens when requested by the owner."""
+    with d.store.tx() as conn:
+        result = _pause_dispatch(conn, principal, body)
+    if principal == 'owner':
+        d.leases.clear()
+    return result
+
+
+def r_abort_all(d, principal, body, query):
+    """Pause dispatch durably, then request cancellation. Never claim all processes were killed."""
+    request_id = secrets.token_hex(12)
+    with d.store.tx() as conn:
+        result = _pause_dispatch(conn, principal, body)
+        for b in builders.list_(conn):
+            conn.execute("INSERT INTO cancellations(builder,request_id,state,detail,updated) VALUES(?,?,'pending','',?) "
+                         "ON CONFLICT(builder) DO UPDATE SET request_id=excluded.request_id,state='pending',"
+                         "detail='',updated=excluded.updated", (b['name'], request_id, d.engine.clock()))
+        journal.append(conn, 'ABORT_REQUESTED', 'ACTION', caller=principal,
+                       data={'request_id': request_id, 'note': 'cancellation requested; status reports evidence, '
+                             'not a guarantee that detached processes stopped'})
+        verification = d.verifier.abort_all()
+    if principal == 'owner':
+        d.leases.clear()
+    result.update({'request_id': request_id, 'cancellation': 'pending', 'verification': verification})
+    d.engine.reset_backoff()
+    return result
 
 
 # --- approvals and questions --------------------------------------------------------------------------------
@@ -375,6 +403,10 @@ def r_resume_all(d, principal, body, query):
     with d.store.tx() as conn:
         if not meta_get(conn, "stop_all"):
             raise feeds.Refused("not stopped")
+        pending = conn.execute("SELECT COUNT(*) FROM cancellations WHERE state IN ('pending','sending','requested',"
+                               "'acknowledged')").fetchone()[0]
+        if pending:
+            raise feeds.Refused('abort requests are still in progress; inspect status before resuming')
         meta_set(conn, "stop_all", None)
         journal.append(conn, "RESUME_ALL", "NOTICE", caller=principal)
     return {"stopped": False}
@@ -491,6 +523,8 @@ def r_round_message(d, principal, body, query):
 def r_round_verify(d, principal, body, query):
     rid = str(_req(body, "id"))
     with d.store.tx() as conn:
+        if meta_get(conn, 'stop_all'):
+            raise rounds.Conflict('verification is paused; the owner must resume first')
         r = rounds.get(conn, rid)
         if r["state"] in rounds.TERMINAL or r["state"] == rounds.PENDING:
             raise rounds.Conflict(f"round {rid} is {r['state']}; nothing to verify")
@@ -503,7 +537,9 @@ def r_round_verify(d, principal, body, query):
         conn.execute("UPDATE rounds SET verify_job=? WHERE id=?", (job, rid))
         journal.append(conn, "VERIFY_REQUESTED", "INFO", builder=r["builder"], caller=principal,
                        data={"round": rid, "generation": r["generation"], "job": job})
-    d.verifier.submit(rid, job)
+        # Queue under the same store lock as admission/abort: no job can slip into a new cancellation epoch
+        # after it was admitted before a concurrent abort. The worker waits for this transaction to commit.
+        d.verifier.submit(rid, job)
     return {"round": rid, "job": job, "note": "running; watch the round's state or the feed"}
 
 
@@ -614,7 +650,8 @@ def r_check_define(d, principal, body, query):
         c = rounds.define_check(conn, cid=str(_req(body, "id")), scope=scope, argv=_req(body, "argv"),
                                 working_dir=body.get("working_dir") or ".", env=body.get("env") or [],
                                 timeout=body.get("timeout", 1800), must_fail_on_base=bool(body.get("must_fail_on_base")),
-                                depends=depends, required=body.get("required", True) is not False, principal=principal)
+                                depends=depends, required=body.get("required", True) is not False, principal=principal,
+                                base_failure_codes=body.get('base_failure_codes'))
     return {"check": c}
 
 
@@ -629,7 +666,8 @@ def r_check_approve(d, principal, body, query):
     with d.store.tx() as conn:
         n = rounds.define_check(conn, cid=cid, scope=c["scope"], argv=c["argv"], working_dir=c["working_dir"],
                                 env=c["env"], timeout=c["timeout"], must_fail_on_base=c["must_fail_on_base"],
-                                depends=depends, required=c["required"], principal=principal)
+                                depends=depends, required=c["required"], principal=principal,
+                                base_failure_codes=c['base_failure_codes'])
         journal.append(conn, "CHECK_REAPPROVED", "NOTICE", caller=principal,
                        data={"check": cid, "version": n["version"], "previous": c["depends"], "now": depends})
     return {"check": n}
@@ -893,6 +931,7 @@ ROUTES = {
     ("POST", "/v1/builders/resume"): (r_builder_resume, "owner", True),
     ("POST", "/v1/builders/allow-version"): (r_builder_allow_version, "owner", True),
     ("POST", "/v1/stop-all"): (r_stop_all, "any", True),
+    ("POST", "/v1/abort-all"): (r_abort_all, "any", True),
     ("POST", "/v1/resume-all"): (r_resume_all, "owner", True),
     ("POST", "/v1/send"): (r_send, "any", True),
     ("GET", "/v1/message"): (r_message, "any", False),
@@ -952,7 +991,7 @@ RENEWS_LEASE = {"/v1/events_since", "/v1/ack", "/v1/show", "/v1/send", "/v1/canc
 # State changes still allowed while quarantined: reading feeds (which records what was shown), backups,
 # stopping, and the owner's release. Everything that dispatches, decides or changes trust waits [C6].
 QUARANTINE_OK = {"/v1/events_since", "/v1/ack", "/v1/consumers", "/v1/backup", "/v1/quarantine/release",
-                 "/v1/shutdown", "/v1/stop-all", "/v1/cancel"}
+                 "/v1/shutdown", "/v1/stop-all", "/v1/abort-all", "/v1/cancel"}
 
 
 def _req(body, key):
@@ -1303,6 +1342,18 @@ class Daemon:
         with self.store.tx() as conn:
             tokens.finish_rotation(conn, self.home)
             outbox.recover(conn)
+            if meta_get(conn, 'verification_policy_upgrade_pending'):
+                journal.append(conn, 'VERIFICATION_POLICY_CHANGED', 'ACTION',
+                               data={'note': 'live verification evidence invalidated by the runner/baseline policy '
+                                     'upgrade; configure verification and verify again; historical decisions remain'})
+                meta_set(conn, 'verification_policy_upgrade_pending', None)
+            for row in conn.execute("SELECT builder,request_id FROM cancellations WHERE state IN "
+                                    "('sending','requested','acknowledged')").fetchall():
+                detail = 'daemon restarted during cancellation; inspect the agent before resuming'
+                conn.execute("UPDATE cancellations SET state='uncertain',detail=?,updated=? WHERE builder=?",
+                             (detail, time.time(), row['builder']))
+                journal.append(conn, 'BUILDER_ABORT_STATUS', 'ACTION', builder=row['builder'],
+                               data={'request_id': row['request_id'], 'state': 'uncertain', 'detail': detail})
             jobs = conn.execute("SELECT id, builder, generation FROM rounds WHERE verify_job IS NOT NULL").fetchall()
             for job in jobs:
                 journal.append(conn, "VERIFY_INTERRUPTED", "NOTICE", builder=job[1],

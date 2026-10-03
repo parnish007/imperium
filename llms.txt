@@ -1,23 +1,24 @@
 # Imperium
 
-> Imperium is an open-source, local supervisor for AI coding agents (Claude Code, OpenCode, Codex, Gemini CLI). It
-> sits between a director AI session, the coding agents doing the work, and their human owner. It delivers
-> instructions with proof (never silently lost or sent twice), records every event in a hash-chained journal,
-> routes agents' permission prompts to approvals with a human in the loop, and accepts an agent's "done" only after
-> trusted checks the agent cannot edit pass on a snapshot of the code.
+> A local pre-alpha supervisor for AI coding builders: durable delivery outcomes, acknowledged feeds, explicit
+> completion claims, snapshot verification and principal-controlled acceptance. Uncertainty is recorded, not
+> silently retried. Evidence and capabilities depend on the adapter.
 
-Key facts:
-- One local Python service (3.11+), standard library only, SQLite; no cloud, no account. MIT licence.
-- Agents: OpenCode over its HTTP server, and any Agent Client Protocol (ACP) agent, which Imperium starts itself.
-- Director: a generated Claude Code plugin (MCP server, hooks, playbook skill); any MCP client can use the tools.
-- Uncertain deliveries are never retried automatically; they wait for a decision.
-- Isolation mode runs agents under their own OS account, reachable only through an OS-checked named pipe or Unix socket.
-- Runs on Windows, Linux and macOS.
+- Python 3.11+, Git, SQLite; the control service has no mandatory third-party Python dependency.
+- Verification defaults to restricted Docker/Linux containers with an owner-prepared pinned image, no host fallback.
+- OpenCode 1.18.32 has small published demonstrations over HTTP and ACP. Other ACP products remain unvalidated targets.
+- HTTP observes subagents; ACP reports subagent visibility as unknown and readiness at the active-session scope.
+- stop-all pauses dispatch. abort-all requests cancellation and reports per-builder outcomes; detached processes may survive.
+- Same-user owner/director credentials remain cooperative boundaries. Separate builder isolation is still needed.
+- No comparative real-task productivity or reliability improvement is claimed.
 
 ## Docs
 
-- [README](https://github.com/parnish007/imperium/blob/main/README.md): what it is, install, quick start, FAQ
-- [How to use](https://github.com/parnish007/imperium/blob/main/HOWTOUSE.md): step-by-step guide, from install to everyday use
-- [Specification](https://github.com/parnish007/imperium/blob/main/docs/SPEC.md): guarantees, states and limits
-- [Isolation mode](https://github.com/parnish007/imperium/blob/main/docs/ISOLATION.md): agents under their own account
-- [Benchmarks](https://github.com/parnish007/imperium/blob/main/docs/benchmarks.md): measured numbers, comparison sources
+- [How to use](https://github.com/parnish007/imperium/blob/main/HOWTOUSE.md)
+- [README](https://github.com/parnish007/imperium/blob/main/README.md)
+- [Specification](https://github.com/parnish007/imperium/blob/main/docs/SPEC.md)
+- [Verification](https://github.com/parnish007/imperium/blob/main/docs/VERIFICATION.md)
+- [Adapters](https://github.com/parnish007/imperium/blob/main/docs/ADAPTERS.md)
+- [Validation](https://github.com/parnish007/imperium/blob/main/docs/VALIDATION.md)
+- [Isolation](https://github.com/parnish007/imperium/blob/main/docs/ISOLATION.md)
+- [Benchmarks](https://github.com/parnish007/imperium/blob/main/docs/benchmarks.md)

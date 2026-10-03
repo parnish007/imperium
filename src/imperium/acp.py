@@ -47,6 +47,7 @@ PERMISSION_NAMES = {"execute": "bash", "edit": "edit", "delete": "edit", "move":
 REPLY_KINDS = {"once": ("allow_once",), "always": ("allow_always", "allow_once"), "reject": ("reject_once",)}
 STARTUP_TIMEOUT = 60.0
 LOAD_TIMEOUT = 180.0
+WRITE_TIMEOUT = 10.0
 
 
 class AcpError(RuntimeError):
@@ -107,6 +108,8 @@ class Connection:
         self.env = env
         self.session_id = builder["session_id"]
         self.lock = threading.Lock()
+        self.write_lock = threading.Lock()
+        self.write_broken = None
         self.cond = threading.Condition(self.lock)
         self.proc = None
         self.run = None  # a fresh label per process, so approval ids never repeat across restarts
@@ -125,6 +128,9 @@ class Connection:
         self.stderr = collections.deque(maxlen=50)
         self.next_id = 0
         self.exit_reported = True
+        self.progress = 0  # session-scoped, monotonically increases on real turn activity
+        self.cancel_requested = False
+        self.cancel_confirmed = False
 
     # --- process ------------------------------------------------------------------------------------
     @property
@@ -138,16 +144,24 @@ class Connection:
         kw = {"creationflags": 0x08000000} if os.name == "nt" else {"start_new_session": True}  # no console window
         try:
             self.proc = subprocess.Popen([exe] + self.argv[1:], cwd=self.directory, stdin=subprocess.PIPE,
-                                         stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=self.env, **kw)
+                                         stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=self.env, bufsize=0, **kw)
         except OSError as e:
             raise opencode.OCUnreachable(f"cannot start {self.argv[0]}: {e}") from None
         self.run = secrets.token_hex(4)
         with self.lock:
             self.ready, self.current, self.perms, self.tools = False, None, {}, {}
+            self.cancel_requested = self.cancel_confirmed = False
             self.exit_reported = False
         threading.Thread(target=self._read_stdout, args=(self.proc,), daemon=True,
                          name=f"imperium-acp-{self.name}").start()
         threading.Thread(target=self._read_stderr, args=(self.proc,), daemon=True).start()
+        try:
+            self._initialize()
+        except (opencode.OCError, opencode.OCUnreachable):
+            self.close()  # an alive but uninitialized process must not disable retries forever
+            raise
+
+    def _initialize(self):
         init = self.request("initialize", {"protocolVersion": PROTOCOL_VERSION,
                                            "clientCapabilities": {"fs": {"readTextFile": False,
                                                                          "writeTextFile": False},
@@ -226,12 +240,38 @@ class Connection:
 
     # --- wire -------------------------------------------------------------------------------------------
     def _write(self, msg):
-        line = json.dumps(msg, ensure_ascii=False, separators=(",", ":")) + "\n"
-        try:
-            self.proc.stdin.write(line.encode("utf-8"))
-            self.proc.stdin.flush()
-        except (OSError, ValueError, AttributeError) as e:
-            raise opencode.OCUnreachable(f"the agent process is gone ({type(e).__name__})") from None
+        data = (json.dumps(msg, ensure_ascii=False, separators=(",", ":")) + "\n").encode("utf-8")
+        proc = self.proc
+        if proc is None or proc is self.write_broken or proc.poll() is not None:
+            raise opencode.OCUnreachable('the agent pipe is unavailable')
+        if not self.write_lock.acquire(timeout=WRITE_TIMEOUT):
+            raise opencode.OCUnreachable('the agent pipe is busy')
+        done, errors = threading.Event(), []
+
+        def write():
+            try:
+                remaining = memoryview(data)
+                while remaining:
+                    n = os.write(proc.stdin.fileno(), remaining)
+                    if not n:
+                        raise OSError('closed pipe')
+                    remaining = remaining[n:]
+            except (OSError, ValueError, AttributeError) as e:
+                errors.append(type(e).__name__)
+            finally:
+                self.write_lock.release()
+                done.set()
+
+        threading.Thread(target=write, daemon=True, name=f'imperium-acp-write-{self.name}').start()
+        if not done.wait(WRITE_TIMEOUT):
+            # A process that stopped reading stdin must not occupy an engine worker indefinitely. Retire this
+            # pipe before killing it; delivery remains uncertain and is never automatically retried.
+            self.write_broken = proc
+            from .verify import _kill_tree
+            _kill_tree(proc)
+            raise opencode.OCUnreachable('agent pipe write timed out; process retired')
+        if errors:
+            raise opencode.OCUnreachable(f'the agent process is gone ({errors[0]})')
 
     def request(self, method, params, timeout):
         with self.lock:
@@ -256,6 +296,8 @@ class Connection:
 
     def _read_stdout(self, proc):
         for raw in iter(proc.stdout.readline, b""):
+            if proc is not self.proc:
+                return  # a retired process cannot supply evidence for its replacement
             try:
                 msg = json.loads(raw)
             except ValueError:
@@ -304,6 +346,8 @@ class Connection:
                              "source_key": None})
 
     def _update(self, params):
+        if params.get("sessionId") != self.session_id:
+            return
         u = params.get("update") or {}
         kind = u.get("sessionUpdate")
         if kind in ("tool_call", "tool_call_update") and u.get("toolCallId"):
@@ -311,6 +355,8 @@ class Connection:
             t.update({k: v for k, v in u.items() if v is not None})
         with self.lock:
             replaying, cur = self.replaying, self.current
+            if not replaying and cur is not None and kind in TURN_UPDATES:
+                self.progress += 1
         if replaying:
             self._replayed(kind, u)
             return
@@ -341,14 +387,16 @@ class Connection:
     def _prompt_answered(self, cur, msg):
         """Called with the lock held: the agent answered the prompt in flight."""
         self.current = None
+        self.cancel_confirmed = (msg.get("result") or {}).get("stopReason") == "cancelled"
         for aid in list(self.perms):  # requests of a finished turn are void
             self.perms.pop(aid)
             self.out.append({"type": "PERMISSION_GONE", "severity": "INFO", "data": {"permission_id": aid},
                              "untrusted": None, "source_key": None})
-        if "error" in msg and not cur["seen"]:
+        if ("error" in msg or self.cancel_confirmed) and not cur["seen"]:
             err = msg.get("error") or {}
             self.out.append({"type": "ACP_PROMPT_REFUSED", "severity": "ACTION",
-                             "data": {"message_id": cur["oc_id"], "code": err.get("code")},
+                             "data": {"message_id": cur["oc_id"], "code": err.get("code"),
+                                      'cancelled': self.cancel_confirmed},
                              "untrusted": untrusted.clean({"error": err.get("message")}, self.secrets),
                              "source_key": None})
             return
@@ -367,6 +415,10 @@ class Connection:
                          "untrusted": None, "source_key": None})
 
     def _permission(self, rpc_id, params):
+        if params.get("sessionId") != self.session_id:
+            self._write_quiet({"jsonrpc": "2.0", "id": rpc_id,
+                               "result": {"outcome": {"outcome": "cancelled"}}})
+            return
         tool = dict(self.tools.get((params.get("toolCall") or {}).get("toolCallId"), {}))
         tool.update({k: v for k, v in (params.get("toolCall") or {}).items() if v is not None})
         aid = f"acp_{self.run}_{rpc_id}"
@@ -402,10 +454,13 @@ class Connection:
         with self.lock:
             status = "busy" if self.current else "idle"
             perms = sorted(self.perms)
+            progress = self.progress
         cp.update({"attached": self.ready, "phase": None, "protocol": PROTOCOL_VERSION,
                    "version": f"acp:{self.info.get('name', '?')}/{self.info.get('version', '?')}",
                    "acp_session": self.session_id, "permissions": perms, "questions": [], "status": status,
-                   "open": {}, "busy_children": []})
+                   "open": {}, "busy_children": None, "progress_seq": progress,
+                   "subagent_visibility": "unavailable", "readiness_scope": "session",
+                   "cancel_confirmed": self.cancel_confirmed})
         yield self._drain(), cp
 
     def _drain(self):
@@ -428,6 +483,7 @@ class Connection:
             self.current = {"oc_id": oc_id, "seen": False,
                             "token": (tok.group(1), tok.group(2), {k: fields[k] for k in ("round", "gen")
                                                                    if k in fields})}
+            self.cancel_requested = self.cancel_confirmed = False
         try:
             self._write({"jsonrpc": "2.0", "id": oc_id, "method": "session/prompt",
                          "params": {"sessionId": self.session_id, "prompt": [{"type": "text", "text": text}]}})
@@ -441,6 +497,19 @@ class Connection:
         if oc_id in self.seen:
             return {"id": oc_id}
         raise opencode.OCError(404, None, "message")
+
+    def cancel(self):
+        """ACP cancellation is a notification, not an acknowledgement that work stopped.
+
+        Confirmation comes only from the active prompt's response with stopReason=cancelled.
+        Detached subprocesses are outside this guarantee.
+        """
+        with self.lock:
+            if self.current is None:
+                return "idle_observed"
+            self.cancel_requested = True
+        self._write({"jsonrpc": "2.0", "method": "session/cancel", "params": {"sessionId": self.session_id}})
+        return "requested"
 
     def reply_permission(self, aid, reply):
         with self.lock:

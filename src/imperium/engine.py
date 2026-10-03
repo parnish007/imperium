@@ -15,6 +15,7 @@ import logging
 import os
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, wait
 
 from . import acp, approvals, builders, journal, liveness, opencode, outbox, rounds, snapshot
 from .reader import Reader
@@ -35,6 +36,8 @@ class Engine:
         self.health = {}
         self.acp = {}  # builder name -> acp.Connection (agent processes Imperium owns)
         self.thread = None
+        self.executor = ThreadPoolExecutor(max_workers=self.cfg['max_workers'], thread_name_prefix='imperium-poll')
+        self.pending = {}  # builder -> future; a builder never has overlapping polls
 
     def start(self):
         self.thread = threading.Thread(target=self._loop, name="imperium-engine", daemon=True)
@@ -44,6 +47,7 @@ class Engine:
         self.stop_event.set()
         if self.thread:
             self.thread.join(30)
+        self.executor.shutdown(wait=True, cancel_futures=True)
         for conn in list(self.acp.values()):
             conn.close()
         self.acp.clear()
@@ -51,12 +55,12 @@ class Engine:
     def _loop(self):
         while not self.stop_event.wait(self.cfg["poll_interval"]):
             try:
-                self.run_once(respect_backoff=True)
+                self.run_once(respect_backoff=True, wait_for_polls=False)
             except Exception:  # the loop must survive anything; the error is logged
                 log.exception("engine cycle failed")
 
     def reset_backoff(self):
-        for h in self.health.values():
+        for h in list(self.health.values()):
             h["next"] = 0.0
 
     def secrets(self, rows):
@@ -69,25 +73,38 @@ class Engine:
         values += [os.environ.get(n) for n in self.d.cfg["redaction"]["env_names"]]
         return [v for v in values if v]
 
-    def run_once(self, respect_backoff=False):
+    def run_once(self, respect_backoff=False, wait_for_polls=True):
         with self.lock:
-            if self.d.store.failed or self.d.quarantine():
+            if self.stop_event.is_set() or self.d.store.failed:
                 return
             if time.monotonic() - self.verified_at >= self.d.cfg["integrity"]["verify_interval"]:
                 self.verified_at = time.monotonic()
                 c = self.d.refresh_chain()
                 if not c["ok"]:
                     self.d.enter_quarantine(c)
-                    return
             with self.d.store.read() as conn:
                 rows = builders.list_(conn)
             secrets = self.secrets(rows)
+            for name, future in list(self.pending.items()):
+                if future.done():
+                    del self.pending[name]
+                    try:
+                        future.result()
+                    except Exception:
+                        log.exception('builder poll failed: %s', name)
             for name in set(self.acp) - {b["name"] for b in rows if b["adapter"] == "acp"}:
-                self.acp.pop(name).close()  # removed builders' agents are stopped
+                if name not in self.pending:
+                    self.acp.pop(name).close()  # don't close an adapter while its worker is using it
             for b in rows:
                 if self.stop_event.is_set():
                     return
-                self._poll(b, secrets, respect_backoff)
+                if b['name'] not in self.pending:
+                    self.pending[b['name']] = self.executor.submit(self._poll, b, secrets, respect_backoff)
+            current = list(self.pending.values())
+        if wait_for_polls:  # deterministic entry point for tests and maintenance; production never waits here
+            wait(current)
+            for future in current:
+                future.result()
 
     def state(self, name):
         h = self.health.get(name) or {}
@@ -99,7 +116,10 @@ class Engine:
         name = b["name"]
         h = self.health.setdefault(name, {"failures": 0, "reachable": None, "next": 0.0, "auth_failed": False,
                                           "last_error": None})
-        if h.get("halted") or (respect_backoff and time.monotonic() < h["next"]):
+        with self.d.store.read() as conn:
+            cancelling = conn.execute("SELECT request_id FROM cancellations WHERE builder=? AND state IN "
+                                      "('pending','sending','requested','acknowledged')", (name,)).fetchone()
+        if not cancelling and (h.get("halted") or (respect_backoff and time.monotonic() < h["next"])):
             return
         if b["adapter"] == "acp":
             conn = self.acp.get(name)
@@ -110,6 +130,9 @@ class Engine:
             try:
                 pw = builders.password(b)
             except OSError as e:
+                if cancelling:
+                    self._abort_status(b, cancelling[0], 'uncertain',
+                                       'cancellation credentials unavailable; inspect the agent directly')
                 self._fail(b, h, "credential", f"cannot read the password file: {e.strerror}")
                 return
             client = opencode.OpenCodeClient(b["endpoint"], directory=b["directory"], password=pw,
@@ -119,6 +142,15 @@ class Engine:
         with self.d.store.read() as conn:
             r = conn.execute("SELECT data FROM checkpoints WHERE builder=?", (name,)).fetchone()
         cp = json.loads(r[0]) if r else None
+        self._abort(b, client)
+        if h.get('halted'):
+            return  # cancellation can still act when reading was halted by conflicting evidence
+        with self.d.store.read() as conn:
+            paused = bool(meta_get(conn, 'stop_all'))
+        if b['adapter'] == 'acp' and paused and not client.alive:
+            return  # a pause/abort must not start a new managed process
+        if self.d.quarantine():
+            return  # cancellation is allowed in quarantine; normal adapter work is not
         try:
             for obs, new_cp in reader.poll(cp):
                 self._commit(b, obs, new_cp)
@@ -164,6 +196,58 @@ class Engine:
             return
 
     # --- delivery ---------------------------------------------------------------------------------------
+    def _abort_status(self, b, request_id, state, detail):
+        with self.d.store.tx() as conn:
+            row = conn.execute('SELECT state FROM cancellations WHERE builder=? AND request_id=?',
+                               (b['name'], request_id)).fetchone()
+            if row is None or row[0] == state:
+                return
+            conn.execute('UPDATE cancellations SET state=?,detail=?,updated=? WHERE builder=? AND request_id=?',
+                         (state, detail, self.clock(), b['name'], request_id))
+            journal.append(conn, 'BUILDER_ABORT_STATUS', 'ACTION', builder=b['name'],
+                           data={'request_id': request_id, 'state': state, 'detail': detail})
+
+    def _abort(self, b, client):
+        with self.d.store.read() as conn:
+            row = conn.execute('SELECT * FROM cancellations WHERE builder=?', (b['name'],)).fetchone()
+        if row is None or row['state'] not in ('pending', 'sending', 'requested', 'acknowledged'):
+            return
+        rid = row['request_id']
+        if row['state'] == 'pending':
+            self._abort_status(b, rid, 'sending', 'cancellation attempt recorded before contacting agent')
+            try:
+                if b['adapter'] == 'acp':
+                    if not client.alive:
+                        self._abort_status(b, rid, 'process_exited', 'managed process is not running; descendants unknown')
+                        return
+                    state = client.cancel()
+                else:
+                    client.abort(b['session_id'])
+                    state = 'acknowledged'
+                self._abort_status(b, rid, state, 'request sent; active-turn cessation is observed separately')
+            except (opencode.OCError, opencode.OCUnreachable, OSError):
+                self._abort_status(b, rid, 'uncertain', 'agent could not confirm cancellation; inspect it directly')
+            return
+        try:
+            if b['adapter'] == 'acp':
+                if client.cancel_confirmed:
+                    self._abort_status(b, rid, 'confirmed', 'ACP active prompt answered with stopReason=cancelled')
+                    return
+                if not client.alive:
+                    self._abort_status(b, rid, 'process_exited', 'managed process exited; descendants unknown')
+                    return
+                with client.lock:
+                    idle = client.current is None
+            else:
+                idle = (client.status_map().get(b['session_id']) or {}).get('type', 'idle') == 'idle'
+            if idle:
+                self._abort_status(b, rid, 'idle_observed', 'session is idle; detached processes are not covered')
+                return
+        except (opencode.OCError, opencode.OCUnreachable):
+            pass
+        if self.clock() - row['updated'] >= 30:
+            self._abort_status(b, rid, 'uncertain', 'cancellation not confirmed within 30 seconds')
+
     def _deliver(self, b, h, client):
         name = b["name"]
         with self.d.store.read() as conn:
@@ -230,7 +314,7 @@ class Engine:
             return f"builder {cp.get('status')}"
         if cp.get("open"):
             return "a message is still being written"
-        if cp.get("busy_children") is None:
+        if cp.get("busy_children") is None and b['adapter'] != 'acp':
             return "sub-agents not yet checked"
         if cp["busy_children"]:
             return "a sub-agent is busy"
