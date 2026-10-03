@@ -13,8 +13,10 @@ def main():
     try:
         with open('/runner/payload.json', encoding='utf-8') as f:
             payload = json.load(f)
-        shutil.copytree('/input', '/work', dirs_exist_ok=True)
-        os.chdir(os.path.join('/work', payload['working_dir']))
+        # /work is a root-owned tmpfs mount. Own a child directory so copytree can preserve snapshot metadata
+        # without requiring chmod/chown privileges on the mount itself.
+        shutil.copytree('/input', '/work/snapshot')
+        os.chdir(os.path.join('/work/snapshot', payload['working_dir']))
         env = dict(os.environ)
         env.update(payload['env'])
         env['HOME'] = '/tmp'

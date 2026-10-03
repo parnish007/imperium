@@ -283,10 +283,11 @@ For a terminal that prints new events as they arrive: `imperium watch`.
 
 Imperium is honest about what it does not do yet:
 
-- It is **not a sandbox**. An agent running as your user can do what you can. Use isolation mode, a container or a
-  VM for containment.
+- The verification runner contains check execution; it does **not** isolate the builder/director processes.
+  An agent running as your user can do what you can. Use isolation mode, a container or a VM for those processes.
 - **Stop-all does not interrupt running work**; it stops anything new from being sent.
 - Builders started over ACP do not report their helper agents, so "helper agents" shows as not visible.
-- A check whose files changed is still run (its result does not count), and a check that timed out or never ran on
-  the original code can be counted as failing there. Look at the base run's exit code before relying on it.
-- A slow ACP agent start can briefly delay checks on other builders.
+- Check definitions and test-runner exit codes are owner trust decisions. If a test runner conflates setup errors
+  and assertion failures, use a wrapper with distinct exit codes; see [VERIFICATION.md](docs/VERIFICATION.md).
+- Polling is concurrent but bounded. If every worker is occupied, queued builders must wait.
+- The historical demonstrations are small. No real-task comparative productivity improvement has been established.

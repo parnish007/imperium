@@ -60,7 +60,7 @@ class Engine:
                 log.exception("engine cycle failed")
 
     def reset_backoff(self):
-        for h in self.health.values():
+        for h in list(self.health.values()):
             h["next"] = 0.0
 
     def secrets(self, rows):

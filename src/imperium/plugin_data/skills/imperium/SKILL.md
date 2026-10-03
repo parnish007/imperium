@@ -170,16 +170,13 @@ numbers (`#123`) rather than repeating a builder's words as fact.
 
 ## Known limits (be careful here)
 
-These are open issues in the current version; work around them as described.
-
-- **A check whose files changed is still run.** Its result is not trusted and does not count, but it runs the
-  candidate code. Do not read anything into its output.
-- **A base run that timed out or never started can be counted as "failed on base".** Before relying on a
-  `must_fail_on_base` check, confirm its base run has a real non-zero `exit_code` and `timed_out` is false.
-- **Stall alarms on ACP builders can be false.** Their progress is not tracked the same way; check the feed and
-  `round_show` before concluding anything.
-- **A slow ACP agent start can delay polling of other builders** by up to a few minutes. Expect late events, not
-  lost ones.
+- **Exit codes are a test-runner contract.** Setup errors must use distinct codes from assertion failures.
+- **ACP readiness covers the current session.** Helper agents and detached work are not observable.
+- **Stall alarms are heuristic.** Matching-session streaming activity resets the timer; genuine silence still
+  needs inspection before deciding what happened.
+- **Worker saturation delays polling.** Concurrency is bounded; a poll interval is not a latency guarantee.
+- **Cancellation has uncertainty.** Inspect per-builder outcomes and detached processes before asking the owner
+  to resume. A sent notification is not proof that work stopped.
 
 ## Never
 
