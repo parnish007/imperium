@@ -374,6 +374,68 @@ class TestAbort(VerificationFixture):
         abort.assert_called_once_with('s')
         self.assertEqual(self.row()['state'], 'acknowledged')
 
+    def test_missing_credentials_report_uncertainty_instead_of_blocking_resume_forever(self):
+        daemon.r_abort_all(self.d, 'director:test', {}, {})
+        with self.store.read() as conn:
+            b = builders.get(conn, 'b')
+        with patch('imperium.builders.password', side_effect=FileNotFoundError('missing password file')):
+            self.e._poll(b, [], True)
+        self.assertEqual(self.row()['state'], 'uncertain')
+
+    def test_builder_with_pending_cancellation_cannot_disappear_from_polling(self):
+        daemon.r_abort_all(self.d, 'director:test', {}, {})
+        with self.store.tx() as conn:
+            conn.execute("UPDATE outbox SET state='CANCELLED' WHERE builder='b'")
+            with self.assertRaises(builders.Conflict):
+                builders.remove(conn, 'b')
+
+    def test_concurrent_abort_covers_job_admitted_before_queue_submission(self):
+        with self.store.tx() as conn:
+            conn.execute('UPDATE rounds SET verify_job=NULL WHERE id=?', (self.rid,))
+        entered, release, abort_started, aborted = (threading.Event() for _ in range(4))
+        errors = []
+        submit = self.v.submit
+        def gated_submit(*args):
+            entered.set()
+            if not release.wait(5):
+                raise AssertionError('test failed to release admission')
+            submit(*args)
+        def request_verify():
+            try:
+                daemon.r_round_verify(self.d, 'director:test', {'id': self.rid}, {})
+            except Exception as e:
+                errors.append(e)
+        def request_abort():
+            abort_started.set()
+            try:
+                daemon.r_abort_all(self.d, 'director:test', {}, {})
+            except Exception as e:
+                errors.append(e)
+            finally:
+                aborted.set()
+        with patch.object(self.v, 'submit', side_effect=gated_submit):
+            verifier = threading.Thread(target=request_verify)
+            aborter = threading.Thread(target=request_abort)
+            verifier.start()
+            try:
+                self.assertTrue(entered.wait(2))
+                aborter.start()
+                self.assertTrue(abort_started.wait(2))
+                self.assertFalse(aborted.wait(0.05), 'abort passed a half-admitted verification job')
+            finally:
+                release.set()
+                verifier.join(5)
+                if aborter.ident is not None:
+                    aborter.join(5)
+        self.assertFalse(errors)
+        self.addCleanup(self.v.stop)
+        with patch.object(self.v, 'run', side_effect=AssertionError('cancelled job executed')) as run:
+            self.v.start()
+            self.assertTrue(self.v.wait_idle(3))
+            run.assert_not_called()
+        with self.store.read() as conn:
+            self.assertIsNone(rounds.get(conn, self.rid)['verify_job'])
+
 
 if __name__ == '__main__':
     unittest.main()

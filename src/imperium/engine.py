@@ -117,7 +117,7 @@ class Engine:
         h = self.health.setdefault(name, {"failures": 0, "reachable": None, "next": 0.0, "auth_failed": False,
                                           "last_error": None})
         with self.d.store.read() as conn:
-            cancelling = conn.execute("SELECT 1 FROM cancellations WHERE builder=? AND state IN "
+            cancelling = conn.execute("SELECT request_id FROM cancellations WHERE builder=? AND state IN "
                                       "('pending','sending','requested','acknowledged')", (name,)).fetchone()
         if not cancelling and (h.get("halted") or (respect_backoff and time.monotonic() < h["next"])):
             return
@@ -130,6 +130,9 @@ class Engine:
             try:
                 pw = builders.password(b)
             except OSError as e:
+                if cancelling:
+                    self._abort_status(b, cancelling[0], 'uncertain',
+                                       'cancellation credentials unavailable; inspect the agent directly')
                 self._fail(b, h, "credential", f"cannot read the password file: {e.strerror}")
                 return
             client = opencode.OpenCodeClient(b["endpoint"], directory=b["directory"], password=pw,

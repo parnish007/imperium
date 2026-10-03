@@ -89,6 +89,18 @@ else:
         result = self.run_check('raise AssertionError("must not run")\n', cancel=cancel)
         self.assertEqual(result['execution']['error'], 'cancelled')
 
+    def test_running_check_is_cancelled_before_its_timeout(self):
+        cancel = threading.Event()
+        timer = threading.Timer(2, cancel.set)
+        timer.start()
+        try:
+            result = self.run_check('import time\ntime.sleep(30)\n', timeout=20, cancel=cancel)
+        finally:
+            timer.cancel()
+        self.assertEqual(result['execution']['error'], 'cancelled')
+        self.assertFalse(result['timed_out'])
+        self.assertLess(result['duration'], 10)
+
     def test_missing_command_is_setup_failure_not_baseline_evidence(self):
         result = check_runner.run(self.cfg, True, ['imperium-nonexistent-command'], str(self.snapshot),
                                   str(self.snapshot), [], 20, str(self.root/'out.log'), {})

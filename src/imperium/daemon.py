@@ -275,31 +275,35 @@ def r_builder_allow_version(d, principal, body, query):
         return {"builder": builders.allow_version(conn, str(_req(body, "name")), _req(body, "version"), principal)}
 
 
-def r_stop_all(d, principal, body, query):
-    """Nothing is sent to any builder until the owner resumes. Anyone may stop; only the owner resumes.
-    When the owner stops everything, open asks are held and director tokens are revoked (DESIGN §11.1): the
-    director claims again after `resume-all`."""
+def _pause_dispatch(conn, principal, body):
     reason = str(body.get("reason") or "stopped").strip()[:200]
-    with d.store.tx() as conn:
-        meta_set(conn, "stop_all", f"{reason} (by {principal})")
-        held = revoked = 0
-        if principal == "owner":
-            held = approvals.hold_all_pending(conn, principal)
-            revoked = conn.execute("UPDATE tokens SET revoked=? WHERE principal LIKE 'director:%' AND revoked IS NULL",
-                                   (journal.now(),)).rowcount
-            conn.execute("UPDATE directors SET released_at=? WHERE released_at IS NULL", (journal.now(),))
-        journal.append(conn, "STOP_ALL", "ACTION", caller=principal,
-                       data={"reason": reason, "approvals_held": held, "director_tokens_revoked": revoked,
-                             "effect": "no message is sent to any builder until `imperium resume-all`"})
-    d.leases.clear() if principal == "owner" else None
+    meta_set(conn, "stop_all", f"{reason} (by {principal})")
+    held = revoked = 0
+    if principal == "owner":
+        held = approvals.hold_all_pending(conn, principal)
+        revoked = conn.execute("UPDATE tokens SET revoked=? WHERE principal LIKE 'director:%' AND revoked IS NULL",
+                               (journal.now(),)).rowcount
+        conn.execute("UPDATE directors SET released_at=? WHERE released_at IS NULL", (journal.now(),))
+    journal.append(conn, "STOP_ALL", "ACTION", caller=principal,
+                   data={"reason": reason, "approvals_held": held, "director_tokens_revoked": revoked,
+                         "effect": "no new message is dispatched until `imperium resume-all`"})
     return {"stopped": True, "approvals_held": held, "director_tokens_revoked": revoked}
+
+
+def r_stop_all(d, principal, body, query):
+    """Pause dispatch; hold asks and revoke director tokens when requested by the owner."""
+    with d.store.tx() as conn:
+        result = _pause_dispatch(conn, principal, body)
+    if principal == 'owner':
+        d.leases.clear()
+    return result
 
 
 def r_abort_all(d, principal, body, query):
     """Pause dispatch durably, then request cancellation. Never claim all processes were killed."""
-    result = r_stop_all(d, principal, body, query)
     request_id = secrets.token_hex(12)
     with d.store.tx() as conn:
+        result = _pause_dispatch(conn, principal, body)
         for b in builders.list_(conn):
             conn.execute("INSERT INTO cancellations(builder,request_id,state,detail,updated) VALUES(?,?,'pending','',?) "
                          "ON CONFLICT(builder) DO UPDATE SET request_id=excluded.request_id,state='pending',"
@@ -307,7 +311,10 @@ def r_abort_all(d, principal, body, query):
         journal.append(conn, 'ABORT_REQUESTED', 'ACTION', caller=principal,
                        data={'request_id': request_id, 'note': 'cancellation requested; status reports evidence, '
                              'not a guarantee that detached processes stopped'})
-    result.update({'request_id': request_id, 'cancellation': 'pending', 'verification': d.verifier.abort_all()})
+        verification = d.verifier.abort_all()
+    if principal == 'owner':
+        d.leases.clear()
+    result.update({'request_id': request_id, 'cancellation': 'pending', 'verification': verification})
     d.engine.reset_backoff()
     return result
 
@@ -530,7 +537,9 @@ def r_round_verify(d, principal, body, query):
         conn.execute("UPDATE rounds SET verify_job=? WHERE id=?", (job, rid))
         journal.append(conn, "VERIFY_REQUESTED", "INFO", builder=r["builder"], caller=principal,
                        data={"round": rid, "generation": r["generation"], "job": job})
-    d.verifier.submit(rid, job)
+        # Queue under the same store lock as admission/abort: no job can slip into a new cancellation epoch
+        # after it was admitted before a concurrent abort. The worker waits for this transaction to commit.
+        d.verifier.submit(rid, job)
     return {"round": rid, "job": job, "note": "running; watch the round's state or the feed"}
 
 
